@@ -1,0 +1,14 @@
+use_ascender: true
+asc_bias_enc: true
+asc_bias_dec_self: true
+asc_bias_dec_cross: true
+asc_cfg:
+  use_alignment: true
+  use_separation: true
+  use_cohesion: true
+  w_align: 0.2
+  w_sep: 0.15
+  w_coh: 0.10
+  sigma_sep: 1.0
+  sigma_coh: 4.0
+  align_source: "qk"

@@ -1,0 +1,7 @@
+region         = "us-east-1"
+subnet_id      = "subnet-0b88fdebc0ad3bc7b"
+security_group = "sg-0a670dda5d7fec182"
+key_name       = "ascender-key"
+bucket_name    = "ascender-research-20251005"
+gpu_ami        = "ami-003b184e823d3e894"
+cpu_ami        = "ami-03c4f11b50838ab5d"
