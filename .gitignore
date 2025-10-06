@@ -20,3 +20,11 @@ terraform.rc
 .env.development.local
 .env.test.local
 .env.ci.local
+
+*.tfvars
+**/*.tfvars
+*.tfvars.json
+# Ignore override files as they are usually used to override resources locally and so
+
+*.pem
+# Ignore CLI configuration files

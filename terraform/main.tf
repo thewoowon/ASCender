@@ -24,7 +24,12 @@ variable "cpu_ami" { default = "ami-xxxxxxxx" } # Amazon Linux 2023 등
 variable "instance_profile_name" { default = "AscenderEC2Profile" }
 
 # S3 bucket (lifecycle: 30일 후 IA, 90일 후 Glacier Instant Retrieval)
-resource "aws_s3_bucket" "asc" { bucket = var.bucket_name }
+resource "aws_s3_bucket" "asc" { 
+  bucket = var.bucket_name 
+  lifecycle {
+    prevent_destroy = true
+  }
+}
 resource "aws_s3_bucket_lifecycle_configuration" "asc_lc" {
   bucket = aws_s3_bucket.asc.id
   rule {

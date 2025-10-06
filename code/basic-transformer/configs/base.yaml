@@ -1,0 +1,16 @@
+task: "iwslt14_en_de"   # or "wikitext2_lm"
+epochs: 50
+batch_size: 128
+lr: 1.0
+warmup_steps: 4000
+label_smoothing: 0.1
+grad_clip: 1.0
+d_model: 512
+n_heads: 8
+n_layers_enc: 6
+n_layers_dec: 6
+d_ff: 2048
+dropout: 0.1
+pad_id: 0
+max_len: 256
+eval_every_steps: 1000
