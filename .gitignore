@@ -1,0 +1,22 @@
+# terraform files
+*.tfstate
+*.tfstate.backup
+.terraform/
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc    
+
+# local env files
+.env.local
+.env.*.local    
+# .env.test.local is ignored to allow for test environment overrides
+.env.test.local
+.env.production.local
+.env.staging.local
+.env.development.local
+.env.test.local
+.env.ci.local

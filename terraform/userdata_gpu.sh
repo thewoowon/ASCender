@@ -12,8 +12,8 @@ pip install datasets sacrebleu sentencepiece accelerate wandb
 
 # 프로젝트 배치
 mkdir -p /home/ubuntu/asc && cd /home/ubuntu/asc
-aws s3 sync s3://${BUCKET:-REPLACE_ME}/code ./code || true
-aws s3 sync s3://${BUCKET:-REPLACE_ME}/data ./data || true
+aws s3 sync s3://$${BUCKET:-REPLACE_ME}/code ./code || true
+aws s3 sync s3://$${BUCKET:-REPLACE_ME}/data ./data || true
 
 # 스팟 중단 알림 감시 → 즉시 체크포인트 업로드
 cat >/usr/local/bin/asc-spot-guard.sh <<'EOF'
@@ -23,7 +23,7 @@ CKPT_DIR="/home/ubuntu/asc/outputs/checkpoints"
 while true; do
   if curl -s http://169.254.169.254/latest/meta-data/spot/instance-action | grep -q "termination-time"; then
     echo "[SpotGuard] termination notice received, uploading checkpoints..."
-    aws s3 sync "$CKPT_DIR" "s3://${BUCKET}/checkpoints/$(hostname)/" || true
+    aws s3 sync "$CKPT_DIR" "s3://$${BUCKET}/checkpoints/$(hostname)/" || true
     sync
     sleep 70
   fi
