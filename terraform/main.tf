@@ -27,7 +27,7 @@ variable "instance_profile_name" { default = "AscenderEC2Profile" }
 resource "aws_s3_bucket" "asc" { 
   bucket = var.bucket_name 
   lifecycle {
-    prevent_destroy = true
+    # prevent_destroy = true
   }
 }
 resource "aws_s3_bucket_lifecycle_configuration" "asc_lc" {

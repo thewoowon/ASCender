@@ -1,0 +1,30 @@
+model:
+  src_vocab_size: 100
+  tgt_vocab_size: 100
+  d_model: 64
+  n_heads: 4
+  n_layers_enc: 2
+  n_layers_dec: 2
+  d_ff: 128
+  dropout: 0.1
+  pad_id: 0
+  max_len: 256
+  tie_embeddings: true
+  use_ascender: false   # 우선 off로 sanity test
+
+training:
+  epochs: 1
+  batch_size: 8
+  lr: 0.00005
+  warmup_steps: 0
+  clip_grad: 0.5
+  device: mps          # M3면 mps, 아니면 cpu
+
+data:
+  max_seq_length: 16
+  num_samples: 128
+
+special_tokens:
+  pad_id: 0
+  bos_id: 1
+  eos_id: 2

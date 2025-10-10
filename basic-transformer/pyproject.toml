@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "basic-transformer"
+version = "0.1.0"
+description = "Minimal Transformer architecture and ASCender bias integration for local and cloud experiments."
+authors = [
+  { name = "Won Woo", email = "you@example.com" }
+]
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+
+dependencies = [
+  "torch>=2.2",
+  "torchvision",
+  "torchaudio",
+  "datasets",
+  "tqdm",
+  "pyyaml",
+  "sentencepiece",
+  "accelerate"
+]
+
+[project.optional-dependencies]
+dev = [
+  "black",
+  "flake8",
+  "mypy",
+  "ipykernel"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 88
+target-version = ['py311']
+
+[tool.flake8]
+max-line-length = 88
+ignore = [
+  "E203", # whitespace before ':'
+  "W503"  # line break before binary operator
+]

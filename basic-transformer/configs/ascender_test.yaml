@@ -1,0 +1,28 @@
+experiment:
+  name: ascender_m3_test
+  epochs: 10           # bias 영향 누적 확인용
+  batch_size: 8        # 작은 배치 → gradient 변동 확대
+  lr: 0.0005           # 안정된 학습률 (AscBias는 logit-scale 영향 강함)
+  warmup_steps: 200    # 빠른 warmup → bias 작동 시점 앞당김
+  clip_grad: 0.8
+  smoothing: 0.05      # label noise를 줄여 bias 효과가 잘 드러나도록
+
+model:
+  src_vocab_size: 1000
+  tgt_vocab_size: 1000
+  d_model: 256
+  n_heads: 8
+  n_layers_enc: 3
+  n_layers_dec: 3
+  d_ff: 1024
+  dropout: 0.2         # dropout 증가 → bias가 구조적 방향성 주도록 유도
+  pad_id: 0
+  use_ascender: true
+  asc_bias_enc: true
+  asc_bias_dec_self: true
+  asc_bias_dec_cross: true
+
+asc_cfg:
+  beta_align: 1.2      # alignment 강화 (근접 토큰 집중)
+  beta_sep: 0.8        # separation 완화 (확산 방지)
+  beta_coh: 20.0        # cohesion 유지 (전역 맥락)
