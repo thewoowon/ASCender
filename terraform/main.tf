@@ -16,11 +16,11 @@ provider "aws" { region = var.region }
 
 variable "region" { default = "us-east-1" }     # 가용성/스팟 유리 리전
 variable "subnet_id" {}                         # 기존 퍼블릭 서브넷
-variable "security_group" {}                    # SSH 22, 필요시 6006 등
+variable "security_group" {}                    # SSH 22
 variable "key_name" {}                          # EC2 키페어
-variable "bucket_name" {}                       # S3 버킷명 (전역 유일)
+variable "bucket_name" {}                       # S3 버킷
 variable "gpu_ami" { default = "ami-xxxxxxxx" } # Deep Learning AMI (GPU, PyTorch) 최신
-variable "cpu_ami" { default = "ami-xxxxxxxx" } # Amazon Linux 2023 등
+variable "cpu_ami" { default = "ami-xxxxxxxx" } # Amazon Linux 2023
 variable "instance_profile_name" { default = "AscenderEC2Profile" }
 
 # S3 bucket (lifecycle: 30일 후 IA, 90일 후 Glacier Instant Retrieval)
