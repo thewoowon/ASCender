@@ -1,0 +1,18 @@
+experiment:
+  lr: 0.0005
+  warmup_steps: 4000
+  epochs: 5
+  batch_size: 16
+  clip_grad: 1.0
+  smoothing: 0.1
+  seq_len: 64
+
+model:
+  d_model: 256
+  n_heads: 4
+  num_layers: 3
+  dropout: 0.1
+  src_vocab_size: 30000
+  tgt_vocab_size: 30000
+  pad_id: 1
+  use_ascender: true

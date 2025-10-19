@@ -1,9 +1,40 @@
+import csv
+import os
 import argparse
 import yaml
 import torch
+import importlib
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
-from src.models.multiplicative_transformer import Transformer, TransformerConfig, LabelSmoothingLoss, NoamLR
+from src.data.wikitext_loader import get_dataloader
+from datetime import datetime
+from types import SimpleNamespace
+
+
+# from src.models.multiplicative_transformer import Transformer, TransformerConfig, LabelSmoothingLoss, NoamLR
+# additive (전통)
+# from src.models.transformer import Transformer, TransformerConfig, LabelSmoothingLoss, NoamLR
+
+def log_result(csv_path, fields):
+    header = ["timestamp", "mode", "use_ascender", "bias_combo", "seed", "epoch", "avg_loss"]
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    newfile = not os.path.exists(csv_path)
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=header)
+        if newfile:
+            writer.writeheader()
+        writer.writerow(fields)
+
+
+def load_transformer(mode: str):
+    if mode == "multiplicative":
+        module = importlib.import_module("src.models.multiplicative_transformer")
+    elif mode == "additive":
+        module = importlib.import_module("src.models.transformer")
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+    return module.Transformer, module.TransformerConfig, module.LabelSmoothingLoss, module.NoamLR
 
 
 def load_config(path: str):
@@ -105,31 +136,74 @@ def main():
 
     # --- Load Config ---
     cfg_raw = load_config(args.config)
-    exp_cfg = cfg_raw["experiment"]
-    model_cfg = TransformerConfig(**cfg_raw["model"])
+    cfg_raw = SimpleNamespace(**cfg_raw)
+    cfg_raw.dataset = SimpleNamespace(**cfg_raw.dataset)
+    cfg_raw.experiment = SimpleNamespace(**cfg_raw.experiment)
+    cfg_raw.model = SimpleNamespace(**cfg_raw.model)
+    cfg_raw.model.asc_cfg = SimpleNamespace(**cfg_raw.model.asc_cfg)  # ✅ 핵심
 
-    # --- Device ---
-    device = get_device()
-    print(f"\nUsing device: {device}")
-    print(f"[Init] use_ascender={model_cfg.use_ascender}\n")
+    exp_cfg = cfg_raw.experiment
+    seeds = getattr(exp_cfg, "seeds", [42, 43, 44])
+    mode = getattr(cfg_raw, "mode", "multiplicative")
 
-    # --- Model ---
-    torch.manual_seed(42)
-    model = Transformer(model_cfg).to(device)
+    Transformer, TransformerConfig, LabelSmoothingLoss, NoamLR = load_transformer(mode)
+    csv_path = "logs/results_summary.csv"
 
-    # --- Optimizer / Scheduler ---
-    optimizer = torch.optim.AdamW(model.parameters(), lr=exp_cfg["lr"], betas=(0.9, 0.98), eps=1e-9)
-    scheduler = NoamLR(optimizer, d_model=model_cfg.d_model, warmup_steps=exp_cfg["warmup_steps"])
-    criterion = LabelSmoothingLoss(model_cfg.tgt_vocab_size, exp_cfg["smoothing"], ignore_index=model_cfg.pad_id)
+    for seed in seeds:
+        torch.manual_seed(seed)
+        print(f"\n==============================")
+        print(f"🚀 Starting training for seed={seed}")
+        print(f"==============================")
 
-    # --- Dummy Data (or replace with real loader) ---
-    data = make_dummy_data(model_cfg.src_vocab_size, model_cfg.pad_id, exp_cfg["batch_size"], seq_len=20)
+        model_cfg = TransformerConfig(**vars(cfg_raw.model))
+        device = get_device()
+        model = Transformer(model_cfg).to(device)
+
+        optimizer = torch.optim.AdamW(model.parameters(), lr=exp_cfg.lr, betas=(0.9, 0.98), eps=1e-9)
+        scheduler = NoamLR(optimizer, d_model=model_cfg.d_model, warmup_steps=exp_cfg.warmup_steps)
+        criterion = LabelSmoothingLoss(model_cfg.tgt_vocab_size, exp_cfg.smoothing, ignore_index=model_cfg.pad_id)
+
+
+        train_loader, train_ds = get_dataloader(cfg_raw, split="train")
+
+        # === Bias 조합 이름 추출 ===
+        # === Bias 조합 이름 추출 ===
+        asc = model_cfg.asc_cfg
+        combo = []
+        def on(flag, w):
+            return getattr(asc, flag, True) and float(getattr(asc, w, 0.0)) != 0.0
+
+        if on("use_alignment", "w_align"):   combo.append("A")
+        if on("use_separation", "w_sep"):    combo.append("S")
+        if on("use_cohesion",   "w_coh"):    combo.append("C")
+
+        bias_combo = "+".join(combo) if combo else "None"
+
+        for epoch in range(1, exp_cfg.epochs + 1):
+            print(f"\n🧭 Epoch {epoch}/{exp_cfg.epochs} | seed={seed}")
+            avg_loss = run_epoch(
+                model, train_loader, optimizer, scheduler, criterion, device,
+                exp_cfg.clip_grad, epoch_idx=epoch
+            )
+            print(f"✅ Epoch {epoch} done. AvgLoss={avg_loss:.4f}")
+
+            log_result(csv_path, {
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "mode": mode,
+                "use_ascender": model_cfg.use_ascender,
+                "bias_combo": bias_combo,
+                "seed": seed,
+                "epoch": epoch,
+                "avg_loss": avg_loss,
+            })
+
+        print(f"🏁 Finished seed={seed}")
 
     # --- Training Loop ---
-    for epoch in range(1, exp_cfg["epochs"] + 1):
-        print(f"\n🧭 Epoch {epoch}/{exp_cfg['epochs']}")
-        avg_loss = run_epoch(model, data, optimizer, scheduler, criterion, device, exp_cfg["clip_grad"], epoch_idx=epoch)
-        print(f"✅ Epoch {epoch} done. AvgLoss={avg_loss:.4f}")
+    # for epoch in range(1, exp_cfg["epochs"] + 1):
+    #     print(f"\n🧭 Epoch {epoch}/{exp_cfg['epochs']}")
+    #     avg_loss = run_epoch(model, data, optimizer, scheduler, criterion, device, exp_cfg["clip_grad"], epoch_idx=epoch)
+    #     print(f"✅ Epoch {epoch} done. AvgLoss={avg_loss:.4f}")
 
     # --- Optional Bias Debug Info ---
     if model_cfg.use_ascender:

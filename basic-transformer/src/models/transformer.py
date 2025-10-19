@@ -143,6 +143,10 @@ class MultiHeadAttention(nn.Module):
         attn = self.dropout(attn)
         out = torch.matmul(attn, vh).transpose(1, 2).contiguous().view(B, T, self.d_model)
         out = self.o_proj(out)
+
+        # 🔥 for visualization & entropy tracing
+        self.last_attn = attn.detach()
+
         return out, attn
 
 
@@ -422,7 +426,7 @@ class Transformer(nn.Module):
                     nn.init.zeros_(m.bias)
 
     @torch.inference_mode(False)
-    def forward(self, src: torch.Tensor, tgt_inp: torch.Tensor) -> torch.Tensor:
+    def forward(self, src: torch.Tensor, tgt_inp: torch.Tensor, return_attn: bool = False) -> torch.Tensor:
         """
         src:    (B, S)
         tgt_inp:(B, T) — target tokens shifted right (w/ BOS)
@@ -453,6 +457,15 @@ class Transformer(nn.Module):
                 bmax = float(bias_sample.max())
                 print(f"[Debug] Decoder[0].self_bias stats — mean={bmean:.4f}, std={bstd:.4f}, "
                       f"min={bmin:.4f}, max={bmax:.4f}")
+
+        if return_attn:
+            # decoder 내부에 self-attn / cross-attn 존재
+            attn_maps = []
+            for layer in self.decoder.layers:
+                # (B,H,T,S) 형태면 append
+                if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "last_attn"):
+                    attn_maps.append(layer.self_attn.last_attn)
+            return logits, attn_maps
 
         return logits
 

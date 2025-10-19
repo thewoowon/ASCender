@@ -1,0 +1,12 @@
+Mode: additive
+
+Epoch 01 | Loss=4.2688, GradNorm=1.190, Entropy=3.32784
+Epoch 02 | Loss=4.0177, GradNorm=0.800, Entropy=3.37025
+Epoch 03 | Loss=3.9551, GradNorm=0.716, Entropy=3.38227
+Epoch 04 | Loss=3.9176, GradNorm=0.668, Entropy=3.38839
+Epoch 05 | Loss=3.8911, GradNorm=0.634, Entropy=3.39200
+Epoch 06 | Loss=3.8715, GradNorm=0.612, Entropy=3.39351
+Epoch 07 | Loss=3.8561, GradNorm=0.596, Entropy=3.39373
+Epoch 08 | Loss=3.8434, GradNorm=0.582, Entropy=3.39325
+Epoch 09 | Loss=3.8327, GradNorm=0.571, Entropy=3.39192
+Epoch 10 | Loss=3.8236, GradNorm=0.565, Entropy=3.39048

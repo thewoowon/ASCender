@@ -1,0 +1,26 @@
+{
+  "additive": {
+    "final_loss": 3.823633111124329,
+    "avg_grad": 0.6934034855319331,
+    "final_entropy": 3.390478950745855,
+    "bias_mean": -0.3769396245479584,
+    "bias_std": 0.15475799143314362,
+    "bias_range": 0.6653969287872314
+  },
+  "multiplicative": {
+    "final_loss": 3.8279720866793223,
+    "avg_grad": 0.693412673346888,
+    "final_entropy": 3.4541238289463423,
+    "bias_mean": -0.3005450367927551,
+    "bias_std": 0.15475799143314362,
+    "bias_range": 0.6653969287872314
+  },
+  "diff": {
+    "final_loss": 0.00434,
+    "avg_grad": 1e-05,
+    "final_entropy": 0.06364,
+    "bias_mean": 0.07639,
+    "bias_std": 0.0,
+    "bias_range": 0.0
+  }
+}
