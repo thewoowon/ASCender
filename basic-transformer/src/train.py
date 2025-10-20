@@ -11,10 +11,6 @@ from datetime import datetime
 from types import SimpleNamespace
 
 
-# from src.models.multiplicative_transformer import Transformer, TransformerConfig, LabelSmoothingLoss, NoamLR
-# additive (전통)
-# from src.models.transformer import Transformer, TransformerConfig, LabelSmoothingLoss, NoamLR
-
 def log_result(csv_path, fields):
     header = ["timestamp", "mode", "use_ascender", "bias_combo", "seed", "epoch", "avg_loss"]
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
@@ -64,7 +60,7 @@ def make_dummy_data(vocab_size: int, pad_id: int, batch_size: int, seq_len: int 
     return data
 
 
-def run_epoch(model, data, optimizer, scheduler, criterion, device, clip_grad: float,epoch_idx=None):
+def run_epoch(model, data, optimizer, scheduler, criterion, device, clip_grad: float, epoch_idx=None):
     model.train()
     total_loss = 0.0
     valid_steps = 0
@@ -79,7 +75,6 @@ def run_epoch(model, data, optimizer, scheduler, criterion, device, clip_grad: f
             continue
 
         loss = criterion(logits, tgt_out)
-
         if torch.isnan(loss) or torch.isinf(loss):
             print(f"⚠️ NaN loss detected at step {step}")
             continue
@@ -101,7 +96,6 @@ def run_epoch(model, data, optimizer, scheduler, criterion, device, clip_grad: f
     if model.cfg.use_ascender and (epoch_idx is not None):
         try:
             import matplotlib.pyplot as plt
-            import os
             os.makedirs("logs/heatmaps", exist_ok=True)
 
             first_layer = model.decoder.layers[0]
@@ -140,7 +134,7 @@ def main():
     cfg_raw.dataset = SimpleNamespace(**cfg_raw.dataset)
     cfg_raw.experiment = SimpleNamespace(**cfg_raw.experiment)
     cfg_raw.model = SimpleNamespace(**cfg_raw.model)
-    cfg_raw.model.asc_cfg = SimpleNamespace(**cfg_raw.model.asc_cfg)  # ✅ 핵심
+    cfg_raw.model.asc_cfg = SimpleNamespace(**cfg_raw.model.asc_cfg)
 
     exp_cfg = cfg_raw.experiment
     seeds = getattr(exp_cfg, "seeds", [42, 43, 44])
@@ -148,6 +142,9 @@ def main():
 
     Transformer, TransformerConfig, LabelSmoothingLoss, NoamLR = load_transformer(mode)
     csv_path = "logs/results_summary.csv"
+    os.makedirs("logs", exist_ok=True)
+
+    all_losses = []
 
     for seed in seeds:
         torch.manual_seed(seed)
@@ -163,11 +160,8 @@ def main():
         scheduler = NoamLR(optimizer, d_model=model_cfg.d_model, warmup_steps=exp_cfg.warmup_steps)
         criterion = LabelSmoothingLoss(model_cfg.tgt_vocab_size, exp_cfg.smoothing, ignore_index=model_cfg.pad_id)
 
-
         train_loader, train_ds = get_dataloader(cfg_raw, split="train")
 
-        # === Bias 조합 이름 추출 ===
-        # === Bias 조합 이름 추출 ===
         asc = model_cfg.asc_cfg
         combo = []
         def on(flag, w):
@@ -176,17 +170,14 @@ def main():
         if on("use_alignment", "w_align"):   combo.append("A")
         if on("use_separation", "w_sep"):    combo.append("S")
         if on("use_cohesion",   "w_coh"):    combo.append("C")
-
         bias_combo = "+".join(combo) if combo else "None"
 
         for epoch in range(1, exp_cfg.epochs + 1):
             print(f"\n🧭 Epoch {epoch}/{exp_cfg.epochs} | seed={seed}")
-            avg_loss = run_epoch(
-                model, train_loader, optimizer, scheduler, criterion, device,
-                exp_cfg.clip_grad, epoch_idx=epoch
-            )
+            avg_loss = run_epoch(model, train_loader, optimizer, scheduler, criterion, device, exp_cfg.clip_grad, epoch_idx=epoch)
             print(f"✅ Epoch {epoch} done. AvgLoss={avg_loss:.4f}")
 
+            all_losses.append(avg_loss)
             log_result(csv_path, {
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "mode": mode,
@@ -199,25 +190,28 @@ def main():
 
         print(f"🏁 Finished seed={seed}")
 
-    # --- Training Loop ---
-    # for epoch in range(1, exp_cfg["epochs"] + 1):
-    #     print(f"\n🧭 Epoch {epoch}/{exp_cfg['epochs']}")
-    #     avg_loss = run_epoch(model, data, optimizer, scheduler, criterion, device, exp_cfg["clip_grad"], epoch_idx=epoch)
-    #     print(f"✅ Epoch {epoch} done. AvgLoss={avg_loss:.4f}")
+    # === Save summarized metrics for comparison ===
+    metrics_dir = f"logs/{mode}_logs"
+    os.makedirs(metrics_dir, exist_ok=True)
+    torch.save({
+        "losses": all_losses,
+        "attn_entropies": [],
+        "grad_norms": [],
+        "bias_stats": []
+    }, f"{metrics_dir}/metrics.pt")
+    print(f"✅ Saved metrics.pt → {metrics_dir}/metrics.pt")
 
     # --- Optional Bias Debug Info ---
-    if model_cfg.use_ascender:
+    if hasattr(model_cfg, "use_ascender") and model_cfg.use_ascender:
         print("\n[DEBUG] Checking one sample Ascender bias matrix stats...")
         first_layer = model.decoder.layers[0]
         if first_layer.biaser_self is not None:
-            # 샘플 토큰 길이 정의 (20이 아니면 데이터셋 길이에 맞게)
             T = 20
-            # 임의의 qh, kh를 biaser_self에 전달
             h = torch.zeros((1, T, model.cfg.d_model), device=device)
             qh = first_layer.self_attn._shape(first_layer.self_attn.q_proj(h))
             kh = first_layer.self_attn._shape(first_layer.self_attn.k_proj(h))
-            bias = first_layer.biaser_self(qh, kh, pre_q=h, pre_k=h)[0, 0].detach().cpu()  # (T,T)
-            
+            bias = first_layer.biaser_self(qh, kh, pre_q=h, pre_k=h)[0, 0].detach().cpu()
+
             import matplotlib.pyplot as plt
             plt.style.use("seaborn-v0_8")
             plt.figure(figsize=(5, 4))
@@ -230,7 +224,7 @@ def main():
             plt.show()
 
             print(f"  Bias stats — mean={bias.mean():.4f}, std={bias.std():.4f}, "
-                f"min={bias.min():.4f}, max={bias.max():.4f}")
+                  f"min={bias.min():.4f}, max={bias.max():.4f}")
 
     print("\nTraining complete ✅")
 
