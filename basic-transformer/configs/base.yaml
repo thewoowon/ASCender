@@ -1,28 +1,29 @@
 # ==========================================
-# Baseline Transformer Configuration
-# (No ASCender Bias)
+# ASCender Experiment Configuration
 # ==========================================
 
+# Transformer Attention Mode
+# (Choose between: multiplicative / additive)
+
 dataset:
-  name: "wikitext-2-v1"
+  name: "wikitext-2-v1"   # or "wikitext-103-v1"
   seq_len: 128
   batch_size: 8
   vocab_size: 30000
   num_workers: 2
   pin_memory: true
 
-# transformer variant (additive/multiplicative 둘 다 가능)
-mode: multiplicative
+mode: additive   # ⬅️ ASCender는 softmax 이전 additive가 효과적
 
 experiment:
-  seeds: [42, 43, 44]
-  name: baseline_multiplicative
-  epochs: 10
-  batch_size: 8
-  lr: 0.0005
-  warmup_steps: 200
+  name: baseline_additive
+  seeds: [42, 43, 44]      # 3 seeds for robustness
+  epochs: 10               # bias 효과 누적 관찰
+  batch_size: 8            # 작은 배치 → gradient variance 확대
+  lr: 0.0005               # 안정적 학습률
+  warmup_steps: 200        # 빠른 warmup (Noam과 병행 시 내부 스케줄러 우선)
   clip_grad: 0.8
-  smoothing: 0.05
+  smoothing: 0.05          # label noise 완화로 bias 효과 강화
 
 model:
   src_vocab_size: 1000
@@ -32,14 +33,14 @@ model:
   n_layers_enc: 3
   n_layers_dec: 3
   d_ff: 1024
-  dropout: 0.2
+  dropout: 0.2             # 구조적 bias 방향성이 두드러지게
   pad_id: 0
 
-  # 🚫 ASCender Bias 완전 비활성화
+  # === ASCender Bias Settings ===
   use_ascender: false
-  asc_bias_enc: false
-  asc_bias_dec_self: false
-  asc_bias_dec_cross: false
+  asc_bias_enc: true
+  asc_bias_dec_self: true
+  asc_bias_dec_cross: true
 
   asc_cfg:
     # component switches
@@ -47,15 +48,25 @@ model:
     use_separation: true
     use_cohesion:   true
 
-    # weights
-    w_align: 1.5
-    w_sep: 0.7
-    w_coh: 8.0
+    # weights (z-score된 컴포넌트에 곱해짐)
+    w_align: 1.5    # 주 신호
+    w_sep:   0.5    # 초기 학습 방해 최소화
+    w_coh:   0.5    # 과도한 상수 성분 방지
 
-    # kernels / options (기본값 그대로면 생략 가능)
+    # kernels / options
     sigma_sep: 1.0
-    sigma_coh: 4.0
+    sigma_coh: 3.0   # ⬅️ 4.0→3.0: 평탄화 완화로 대비↑
     align_source: "qk"     # or "preproj"
     temperature: 1.0
     clamp_min: -2.0
     clamp_max: 2.0
+
+    # new: AscenderBias.global_scale 초기값 (logit 스케일 정합)
+    global_scale_init: 1.8
+# ==========================================
+# Notes:
+# - baseline → use_ascender: false
+# - ablations → 특정 가중치 0으로
+#   e.g. Alignment only → w_align=1.5, w_sep=0.0, w_coh=0.0
+# - 필요시 sep warmup은 트레이너에서 스케줄링(초기 몇천 스텝 0→w_sep)
+# ==========================================

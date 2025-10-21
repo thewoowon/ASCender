@@ -1,9 +1,6 @@
 # ==========================================
-# ASCender Experiment Configuration
+# ASCender Experiment Configuration (FINAL)
 # ==========================================
-
-# Transformer Attention Mode
-# (Choose between: multiplicative / additive)
 
 dataset:
   name: "wikitext-2-v1"   # or "wikitext-103-v1"
@@ -13,17 +10,18 @@ dataset:
   num_workers: 2
   pin_memory: true
 
-mode: multiplicative
+# Transformer Attention Mode
+mode: additive   # ASCender는 softmax 이전 additive 전개
 
 experiment:
   name: ascender
-  seeds: [42, 43, 44]      # 3 seeds for robustness
-  epochs: 10               # bias 효과 누적 관찰
-  batch_size: 8            # 작은 배치 → gradient variance 확대
-  lr: 0.0005               # 안정적 학습률
-  warmup_steps: 200        # 빠른 warmup → bias 조기 활성화
+  seeds: [42, 43, 44]      # 3 seeds (필요시 42–46으로 확장)
+  epochs: 10
+  batch_size: 8
+  lr: 0.0005
+  warmup_steps: 200
   clip_grad: 0.8
-  smoothing: 0.05          # label noise 완화로 bias 효과 강화
+  smoothing: 0.05
 
 model:
   src_vocab_size: 1000
@@ -33,38 +31,56 @@ model:
   n_layers_enc: 3
   n_layers_dec: 3
   d_ff: 1024
-  dropout: 0.2             # 구조적 bias 방향성이 두드러지게
+  dropout: 0.1
   pad_id: 0
 
   # === ASCender Bias Settings ===
-  use_ascender: true       # False → baseline transformer
-  asc_bias_enc: true
-  asc_bias_dec_self: true
-  asc_bias_dec_cross: true
+  use_ascender: true
+  asc_bias_enc: false            # encoder OFF 권장
+  asc_bias_dec_self: true        # decoder self-attn ON (코드상 하위 레이어에만 부착)
+  asc_bias_dec_cross: false      # cross-attn OFF 권장
 
   asc_cfg:
     # component switches
     use_alignment:  true
-    use_separation: true
+    use_separation: false
     use_cohesion:   true
 
-    # weights
-    w_align: 1.5
-    w_sep: 0.7
-    w_coh: 8.0
+    # weights (center-only 정규화된 컴포넌트에 곱해진 후 γ/게이트 적용)
+    w_align: 1.1
+    w_sep:   0.0
+    w_coh:   0.3
 
-    # kernels / options (기본값 그대로면 생략 가능)
+    # kernels / options
     sigma_sep: 1.0
-    sigma_coh: 4.0
+    sigma_coh: 2.5
     align_source: "qk"     # or "preproj"
     temperature: 1.0
     clamp_min: -2.0
     clamp_max: 2.0
 
+    # directional & band-pass
+    past_only: true
+    band_min: 2                 # 중거리만 활성
+    band_max: 8
+
+    # scaling (γ) & gate (σ)
+    per_head_scale: true        # 헤드별 γ
+    global_scale_init: 1.0      # 작게 시작 → 학습으로 보정
+    use_gate: true
+    per_head_gate: false        # 필요시 true로 실험
+    gate_init: 0.0              # σ(0)=0.5
+
+    # (옵션) 자동 스케일 캘리브레이션 — 기본은 비활성
+    use_auto_calibrate: false   # true로 켜면 scores_std 전달 필요
+    target_ratio: 0.5
+    calibrate_step_clamp_lo: 0.9
+    calibrate_step_clamp_hi: 1.1
+    ema_momentum: 0.9
+
 # ==========================================
 # Notes:
 # - baseline → use_ascender: false
-# - single bias ablations → set β to 0 for others
-#     e.g. Alignment only → β_A=1.5, β_S=0.0, β_C=0.0
-# - Full ASCender → all β active
+# - 부착 정책: 코드에서 decoder self-attn 하위 레イヤ(예: 0..1)에만 ASCender 부착
+# - 더 공격적 세팅: per_head_gate=true, use_auto_calibrate=true(+scores_std 전달)
 # ==========================================
