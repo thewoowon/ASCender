@@ -61,14 +61,14 @@ model:
 
     # directional & band-pass
     past_only: true
-    band_min: 2                 # 중거리만 활성
+    band_min: 1                 # 중거리만 활성
     band_max: 8
 
     # scaling (γ) & gate (σ)
     per_head_scale: true        # 헤드별 γ
     global_scale_init: 1.0      # 작게 시작 → 학습으로 보정
     use_gate: true
-    per_head_gate: false        # 필요시 true로 실험
+    per_head_gate: true        # 필요시 true로 실험
     gate_init: 0.0              # σ(0)=0.5
 
     # (옵션) 자동 스케일 캘리브레이션 — 기본은 비활성

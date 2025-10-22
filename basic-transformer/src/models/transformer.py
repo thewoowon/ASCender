@@ -125,14 +125,32 @@ class MultiHeadAttention(nn.Module):
         vh = self._shape(self.v_proj(v))   # (B,H,S,dh)
 
         scores = torch.matmul(qh, kh.transpose(-2, -1)) / math.sqrt(self.d_head)  # (B,H,T,S)
-        scores = scores.clamp(-80, 80)  # 안정성
+
+        if attn_bias is not None:
+            with torch.no_grad():
+                # KL/엔트로피 변화를 살짝 체크
+                p0 = F.softmax(scores, dim=-1)                # bias 전
+                p1 = F.softmax(scores + attn_bias, dim=-1)    # bias 후 (가상)
+                delta = (p1 - p0).abs().mean().item()
+                if delta < 1e-5:
+                    print(f"[Warn] ASCender bias has near-zero effect: mean|Δp|={delta:.2e}")
+
 
         if attn_bias is not None:
             assert attn_bias.shape == scores.shape, f"bias {attn_bias.shape} vs scores {scores.shape}"
-            scores = scores + attn_bias  # ASCender: logit-level additive
+            # 1) 적응적 리스케일 (분산 매칭)
+            s_std = scores.detach().float().std().clamp_min(1e-6)
+            b_std = attn_bias.detach().float().std().clamp_min(1e-6)
+            gamma = 0.3  # ← 효과가 ‘확실히’ 보이는 시작점 (0.1~0.5 사이 탐색)
+            attn_bias = attn_bias * (s_std / b_std) * gamma
+
+            scores = scores + attn_bias
 
         if attn_mask is not None:
-            scores = scores.masked_fill(attn_mask, float("-inf"))
+            minval = torch.finfo(scores.dtype).min  # half에서도 안전
+            scores = scores.masked_fill(attn_mask, minval)
+
+        scores = scores.clamp(-80, 80)  # 안정화
 
         attn = F.softmax(scores, dim=-1)
         attn = self.dropout(attn)
@@ -412,24 +430,23 @@ class Transformer(nn.Module):
         logits = self.decoder(tgt_inp, memory, src_pad_mask)
 
         if self.cfg.use_ascender:
-            # Lightweight bias health-check on the first decoder layer (no-grad)
             first_layer = self.decoder.layers[0]
-            if getattr(first_layer, "biaser_self", None) is not None:
+            if getattr(first_layer, "biaser_self", None) is not None and hasattr(first_layer.self_attn, "last_attn"):
                 with torch.no_grad():
-                    T = tgt_inp.size(1)
-                    h = first_layer.ln1(
-                        tgt_inp.new_zeros((1, T, self.cfg.d_model), dtype=torch.float32)
-                    )
+                    # 실제 통과한 h 사용
+                    # 직전 루프의 x를 훔칠 순 없으니 다시 한 번 얇게 태워서 뽑자
+                    B, T = tgt_inp.size()
+                    h = first_layer.ln1(self.decoder.tok_emb(tgt_inp) + self.decoder.pos_enc.pe[:T].unsqueeze(0).to(tgt_inp.device))
                     qh = first_layer.self_attn._shape(first_layer.self_attn.q_proj(h))
                     kh = first_layer.self_attn._shape(first_layer.self_attn.k_proj(h))
                     scores = torch.matmul(qh, kh.transpose(-2, -1)) / math.sqrt(first_layer.self_attn.d_head)
                     attn_bias = first_layer.biaser_self(qh, kh, pre_q=h, pre_k=h)
-                    print(f"[Forward] Applied Ascender bias — src_len={src.size(1)}, tgt_len={tgt_inp.size(1)}")
-                    print(f"[Debug] Decoder[0].scores std={float(scores.std()):.4f} | "
-                          f"bias std={float(attn_bias.std()):.4f} | "
-                          f"ratio={float(attn_bias.std() / (scores.std() + 1e-6)):.3f}")
+
+                    print(f"[Debug] scores std={float(scores.std()):.4f} | bias std={float(attn_bias.std()):.4f} | "
+                        f"ratio={float(attn_bias.std()/(scores.std()+1e-6)):.3f}")
                     bmean = float(attn_bias.mean()); bmin = float(attn_bias.min()); bmax = float(attn_bias.max())
-                    print(f"[Debug] Decoder[0].bias stats — mean={bmean:.4f}, min={bmin:.4f}, max={bmax:.4f}")
+                    print(f"[Debug] bias stats — mean={bmean:.4f}, min={bmin:.4f}, max={bmax:.4f}")
+
 
         if return_attn:
             attn_maps = []
