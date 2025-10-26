@@ -1,9 +1,9 @@
 # ==========================================
-# ASCender Experiment Configuration (STABLE)
+# ASCender Experiment Configuration (CLEAN)
 # ==========================================
 
 dataset:
-  name: "wikitext-2-v1"   # or "wikitext-103-v1"
+  name: "wikitext-2-v1"
   seq_len: 256
   batch_size: 4
   vocab_size: 30000
@@ -11,21 +11,24 @@ dataset:
   pin_memory: true
 
 # Transformer Attention Mode
-mode: additive   # ASCender는 softmax 이전 additive 전개
+mode: additive
 
 experiment:
-  name: ascender_cohesion_stable
+  name: ascender_coh_align_light
   seeds: [42]
   epochs: 3
   batch_size: 4
   lr: 0.0005
+  lr_asc: 0.002         # train.py에서 지원 (없으면 1e-3로 기본)
   warmup_steps: 200
   clip_grad: 0.8
   smoothing: 0.00
 
 model:
-  src_vocab_size: 1000
-  tgt_vocab_size: 1000
+  # ✔ dataset과 일치
+  src_vocab_size: 30000
+  tgt_vocab_size: 30000
+
   d_model: 256
   n_heads: 8
   n_layers_enc: 3
@@ -36,25 +39,25 @@ model:
 
   # === ASCender Bias Settings ===
   use_ascender: true
-  asc_bias_enc: false            # encoder OFF 권장
-  asc_bias_dec_self: true        # decoder self-attn ON (코드상 하위 레이어에만 부착)
-  asc_bias_dec_cross: false      # cross-attn OFF 권장
+  asc_bias_enc: false
+  asc_bias_dec_self: true
+  asc_bias_dec_cross: false
 
   asc_cfg:
-    # component switches (Plan A: cohesion only)
+    # Plan A: cohesion + light alignment (Δp 살짝↑, 과개입 방지)
     use_alignment:  true
     use_separation: false
     use_cohesion:   true
 
-    # weights
-    w_align: 1.0
+    # weights (Δp 소폭 상향)
+    w_align: 1.5
     w_sep:   0.0
-    w_coh:   0.35
+    w_coh:   0.45
 
     # kernels / options
     sigma_sep: 1.0
     sigma_coh: 8.0
-    align_source: "qk"     # Plan B 전환 시 "preproj" 권장
+    align_source: "qk"      # Plan B 전환 시 "preproj" 권장
     temperature: 0.90
     clamp_min: -2.5
     clamp_max: 2.5
@@ -62,9 +65,9 @@ model:
     # directional & band-pass (중거리)
     past_only: true
     band_min: 2
-    band_max: 24
+    band_max: 32
 
-    # per-head (유지) — 포화 방지 캡으로 이질성 확보
+    # per-head
     per_head_scale: true
     per_head_gate:  true
 
@@ -72,28 +75,17 @@ model:
     global_scale_init: 0.8
     use_gate: true
     gate_init: -0.3          # ≈ 0.20 시작
-    gate_floor: 0.30         # 0.20 -> 0.15 (바닥 소폭 낮춤)
-    gate_ceiling: 1.00
+    gate_floor: 0.20         # 코멘트와 값 일치
+    gate_ceiling: 1.05       # 0.65 포화 탈출용(학습 중 필요 시 0.65로 회수)
 
-    # auto-calibration — 타깃 낮춰 과도 개방/증폭 방지
+    # auto-calibration
     use_auto_calibrate: true
-    target_ratio: 0.30       # 0.14 -> 0.08 (현재 ratio≈0.126 < target이면 계속 키우던 문제 차단)
-    calibrate_step_clamp_lo: 0.98
-    calibrate_step_clamp_hi: 1.02
+    target_ratio: 0.26       # 0.30 → 0.26 (안정적 Δp 상향)
+    calibrate_step_clamp_lo: 0.99
+    calibrate_step_clamp_hi: 1.01
     ema_momentum: 0.80
 
     # runtime safety / caps
-    hard_max_ratio: 0.70
-    hard_target_ratio: 0.35
-    gamma_cap: 4.0           # 2.5 -> 1.2 (γ 상한 축소로 포화 방지)
-    
-
-# ==========================================
-# Notes:
-# - Plan B(정렬만) 시험하려면 아래 4줄만 바꾸고 나머지는 유지:
-#     use_alignment: true
-#     use_cohesion:  false
-#     w_align: 1.30
-#     align_source: "preproj"  # + temperature: 0.90 권장
-# - Plan B에서는 target_ratio: 0.14, per_head_*: true 그대로 OK
-# ==========================================
+    hard_max_ratio: 0.60
+    hard_target_ratio: 0.30
+    gamma_cap: 3.5           # 코멘트와 값 일치(완만한 상한)

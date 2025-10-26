@@ -55,28 +55,28 @@ model:
     sigma_sep: 1.0
     sigma_coh: 4.0
     align_source: "qk"     # Plan B 전환 시 "preproj" 권장
-    temperature: 0.95
-    clamp_min: -2.0
-    clamp_max: 2.0
+    temperature: 0.75
+    clamp_min: -4.0
+    clamp_max: 4.0
 
     # directional & band-pass (중거리)
     past_only: true
-    band_min: 1
-    band_max: 10
+    band_min: 0
+    band_max: 24
 
     # per-head (유지) — 포화 방지 캡으로 이질성 확보
     per_head_scale: true
     per_head_gate:  true
 
     # scaling (γ) & gate (σ)
-    global_scale_init: 0.6
+    global_scale_init: 1.2
     use_gate: true
     gate_init: -1.4          # ≈ 0.20 시작
-    gate_floor: 0.20         # 0.20 -> 0.15 (바닥 소폭 낮춤)
+    gate_floor: 0.35         # 0.20 -> 0.15 (바닥 소폭 낮춤)
     gate_ceiling: 1.00
 
     # auto-calibration — 타깃 낮춰 과도 개방/증폭 방지
-    use_auto_calibrate: true
+    use_auto_calibrate: false
     target_ratio: 0.22       # 0.14 -> 0.08 (현재 ratio≈0.126 < target이면 계속 키우던 문제 차단)
     calibrate_step_clamp_lo: 0.98
     calibrate_step_clamp_hi: 1.02
