@@ -49,11 +49,41 @@ def get_device():
     else:
         return torch.device("cpu")
 
+def anneal_ascender(model, cur_step, total_steps):
+    # 스케줄 파라미터
+    ramp = 0.4               # 초반 비율(40%)은 강하게
+    t = cur_step / max(1, total_steps)
+    # target_ratio: 0.30 -> 0.06
+    hi, lo = 0.30, 0.06
+    if t <= ramp:
+        tr = hi
+        gc = 1.00            # gate ceiling
+    else:
+        u = (t - ramp) / (1 - ramp)
+        tr = hi + (lo - hi) * 0.5*(1 - math.cos(math.pi*u))   # cosine
+        gc = 1.00 + (0.70 - 1.00) * u                         # 1.0 -> 0.70
+
+    # γ cap도 살짝 내리기: 4.0 -> 2.5
+    gcap_hi, gcap_lo = 4.0, 2.5
+    gcap = gcap_hi + (gcap_lo - gcap_hi) * max(0.0, (t - ramp)/(1 - ramp))
+
+    # 모델에 반영
+    for dec_l in model.decoder.layers[:2]:
+        b = getattr(dec_l, "biaser_self", None)
+        if b is None: continue
+        b.cfg.target_ratio = float(tr)
+        if hasattr(b.cfg, "gate_ceiling"):
+            b.cfg.gate_ceiling = float(gc)
+        b.cfg.gamma_cap = float(gcap)
+
+
 
 def run_epoch(model, data_loader, optimizer, scheduler, criterion, device, clip_grad: float, epoch_idx=None):
     model.train()
     total_loss = 0.0
     valid_steps = 0
+
+    LOG_EVERY = 10  # ← 원하는 주기
 
     for step, batch in enumerate(data_loader, 1):
         # get_dataloader()가 (src, tgt_inp, tgt_out) 튜플(batch)을 반환한다고 가정
@@ -79,8 +109,89 @@ def run_epoch(model, data_loader, optimizer, scheduler, criterion, device, clip_
         total_loss += float(loss.detach())
         valid_steps += 1
 
-        if step % 10 == 0:
+        if step % 200 == 0 and getattr(model.cfg, "use_ascender", False):
+            model.eval(); 
+            with torch.no_grad():
+                logits_on = model(src, tgt_inp); loss_on = criterion(logits_on, tgt_out).item()
+                saved = []
+                for L in model.decoder.layers[:2]:
+                    b=L.biaser_self
+                    if b is not None and hasattr(b,"gate_param"):
+                        saved.append(b.gate_param.detach().clone()); b.gate_param.fill_(-99.0)
+                logits_off = model(src, tgt_inp); loss_off = criterion(logits_off, tgt_out).item()
+                print(f"[AB] Δloss(ON-OFF)={loss_on - loss_off:+.4f}")
+                for (L,w) in zip(model.decoder.layers[:2], saved):
+                    L.biaser_self.gate_param.data.copy_(w)
+            model.train()
+
+
+        if step % LOG_EVERY == 0:
             print(f"Step {step:03d} | Loss {float(loss):.4f}")
+
+            # ==== ASCender head-wise quick log ====
+            # 여러 레이어 로깅: L0/L1 구분
+            for li in [0, 1]:
+                biaser = getattr(model.decoder.layers[li], "biaser_self", None)
+                if biaser is None or not hasattr(biaser, "gamma_log"): 
+                    continue
+                g_h = torch.exp(biaser.gamma_log.detach()).clamp(max=float(biaser.cfg.gamma_cap))
+                gt = None
+                if getattr(biaser, "gate_param", None) is not None:
+                    gt = torch.sigmoid(biaser.gate_param.detach())
+                    gt = biaser.cfg.gate_floor + (1.0 - biaser.cfg.gate_floor) * gt
+                    gt = torch.minimum(gt, torch.as_tensor(float(biaser.cfg.gate_ceiling), device=gt.device))
+                def mm(x): return float(x.min()), float(x.median()), float(x.max())
+                if gt is not None:
+                    a,b,c = mm(gt); d,e,f = mm(g_h)
+                    print(f"[ASC head][L{li}] gate(min/med/max)={a:.2f}/{b:.2f}/{c:.2f} | γ(min/med/max)={d:.2f}/{e:.2f}/{f:.2f}")
+
+
+
+            # ASC dbg도 동일 주기로만 찍기
+            if getattr(model.cfg, "use_ascender", False):
+                b = getattr(model.decoder.layers[0], "biaser_self", None)
+                if b is not None:
+                    try:
+                        if getattr(b.cfg, "per_head_gate", False) and getattr(b, "gate_param", None) is not None:
+                            g = torch.sigmoid(b.gate_param.detach()).cpu()
+                            gmn, gmd, gmx = g.min().item(), g.median().item(), g.max().item()
+                        else:
+                            gmn = gmd = gmx = float(b.gate_effective or 0.0)
+
+                        if getattr(b.cfg, "per_head_scale", False) and getattr(b, "gamma_log", None) is not None:
+                            gam = torch.exp(b.gamma_log.detach()).clamp(max=b.cfg.gamma_cap).cpu()
+                            amn, amd, amx = gam.min().item(), gam.median().item(), gam.max().item()
+                        else:
+                            ge = float(b.gamma_effective)
+                            amn = amd = amx = ge
+
+                        print(f"[ASC head] gate(min/med/max)={gmn:.2f}/{gmd:.2f}/{gmx:.2f} | "
+                            f"γ(min/med/max)={amn:.2f}/{amd:.2f}/{amx:.2f}")
+                    except Exception as e:
+                        print(f"[ASC head] log failed: {e}")
+
+                if b is not None and hasattr(b, "ema_ratio"):
+                    # 안전 추출 (구버전/신버전 모두 호환)
+                    try:
+                        gamma_eff = b.gamma_effective if hasattr(b, "gamma_effective") else float(
+                            (b.gamma.mean() if hasattr(b, "gamma") else torch.tensor(0.0)).item()
+                        )
+                    except Exception:
+                        gamma_eff = None
+                    try:
+                        if hasattr(b, "gate_effective"):
+                            gate_eff = b.gate_effective
+                        elif hasattr(b, "gate_param") and b.gate_param is not None:
+                            gate_eff = float(torch.sigmoid(b.gate_param).mean().item())
+                        else:
+                            gate_eff = None
+                    except Exception:
+                        gate_eff = None
+
+                    print(f"[ASC dbg] ratio(ema)={float(b.ema_ratio):.3f} | "
+                          f"γ={('None' if gamma_eff is None else f'{gamma_eff:.3f}')} | "
+                          f"gate={('None' if gate_eff is None else f'{gate_eff:.3f}')}")
+
 
     avg_loss = total_loss / max(valid_steps, 1)
 
@@ -183,12 +294,33 @@ def main():
 
         model = Transformer(model_cfg).to(device)
 
-        optimizer = torch.optim.AdamW(model.parameters(), lr=exp_cfg.lr, betas=(0.9, 0.98), eps=1e-9)
+        # (기존) optimizer = torch.optim.AdamW(model.parameters(), lr=exp_cfg.lr, betas=(0.9, 0.98), eps=1e-9)
+        # ──> (교체) biaser/LayerNorm/bias는 weight decay 0, 나머지는 decay
+        decay, no_decay = [], []
+        for n, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            is_asc = ("biaser" in n) or ("gamma_log" in n) or ("gate_param" in n)
+            is_ln  = ("ln" in n.lower()) or ("layernorm" in n.lower()) or ("norm" in n.lower())
+            is_bias = n.endswith(".bias")
+            if is_asc or is_ln or is_bias:
+                no_decay.append(p)
+            else:
+                decay.append(p)
+
+        optimizer = torch.optim.AdamW(
+            [{"params": decay, "weight_decay": 0.01},
+            {"params": no_decay, "weight_decay": 0.0}],
+            lr=exp_cfg.lr, betas=(0.9, 0.98), eps=1e-9
+        )
+
+        # optimizer = torch.optim.AdamW(model.parameters(), lr=exp_cfg.lr, betas=(0.9, 0.98), eps=1e-9)
         scheduler = NoamLR(optimizer, d_model=model_cfg.d_model, warmup_steps=exp_cfg.warmup_steps)
         criterion = LabelSmoothingLoss(model_cfg.tgt_vocab_size, exp_cfg.smoothing, ignore_index=model_cfg.pad_id)
 
         # Bias 조합 태그 (로그용)
         asc = model_cfg.asc_cfg
+        
         combo = []
         def on(flag, w):
             return getattr(asc, flag, True) and float(getattr(asc, w, 0.0)) != 0.0
@@ -198,6 +330,10 @@ def main():
         bias_combo = "+".join(combo) if combo else "None"
 
         for epoch in range(1, exp_cfg.epochs + 1):
+            if hasattr(asc, "target_ratio"):
+                if epoch >= 8:  model.cfg.asc_cfg.target_ratio = 0.26
+                elif epoch >= 5: model.cfg.asc_cfg.target_ratio = 0.24
+
             print(f"\n🧭 Epoch {epoch}/{exp_cfg.epochs} | seed={seed}")
             avg_loss = run_epoch(model, train_loader, optimizer, scheduler, criterion, device, exp_cfg.clip_grad, epoch_idx=epoch)
             print(f"✅ Epoch {epoch} done. AvgLoss={avg_loss:.4f}")

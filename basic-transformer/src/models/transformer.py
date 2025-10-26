@@ -1,8 +1,10 @@
 from __future__ import annotations
 import math
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 from src.models.ascender_bias import AscenderBias, AscenderBiasConfig
+from src.hooks.attn_probe import AttnProbe
 
 import torch
 import torch.nn as nn
@@ -91,7 +93,10 @@ class MultiHeadAttention(nn.Module):
     Pre-LN friendly standard MHA (additive bias before softmax).
     Mask semantics:
       - attn_mask: (B, 1, T, S) bool, True to mask.
-      - attn_bias: (B, H, T, S) additive logit bias (ASCender).
+      - attn_bias: (B, H, T, S) additive logit bias (optional, external).
+    Extra:
+      - self.biaser: Optional[AscenderBias]  # 있으면 내부에서 직접 생성해 더함
+      - self.std_match_ratio: float          # bias 표준화 후 target 스케일 비율(r). 레이어별로 조정 가능.
     """
     def __init__(self, d_model: int, n_heads: int, dropout: float):
         super().__init__()
@@ -106,58 +111,150 @@ class MultiHeadAttention(nn.Module):
         self.o_proj = nn.Linear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
 
+        # ASCender
+        self.biaser: Optional[AscenderBias] = None  # 외부에서 장착
+        self.std_match_ratio: float = 1.0           # 기본 r=1.0 (레이어별로 바꿔 끼우기 용이)
+
     def _shape(self, x: torch.Tensor) -> torch.Tensor:
         # (B, S, d_model) -> (B, H, S, d_head)
         B, S, _ = x.shape
         return x.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
+
+    def _masked_std_scores(
+        self,
+        x: torch.Tensor,            # (B,H,T,S)
+        attn_mask: Optional[torch.Tensor],  # (B,1,T,S) True=mask
+        per_head: bool
+    ) -> torch.Tensor:
+        """유효 위치(= ~mask)만 사용해 QK/√d의 표준편차를 추정."""
+        x = x.float().detach()
+        if attn_mask is None:
+            return x.std(dim=(0, 2, 3)).clamp_min(1e-6) if per_head else x.std().clamp_min(1e-6)
+        valid = (~attn_mask).float()                      # (B,1,T,S)
+        if per_head:
+            # (B,H,T,S) × (B,1,T,S) -> (B,H,T,S)
+            vexp = valid.expand(x.size(0), 1, x.size(2), x.size(3)).expand_as(x)
+            num = vexp.sum(dim=(0, 2, 3)).clamp_min(1.0)                  # (H,)
+            mu  = (x * vexp).sum(dim=(0, 2, 3)) / num                     # (H,)
+            var = (((x - mu.view(1,-1,1,1))**2) * vexp).sum(dim=(0,2,3)) / num
+            return var.sqrt().clamp_min(1e-6)                              # (H,)
+        else:
+            vexp = valid.expand(x.size(0), 1, x.size(2), x.size(3)).expand_as(x)
+            num = vexp.sum().clamp_min(1.0)
+            mu  = (x * vexp).sum() / num
+            var = (((x - mu)**2) * vexp).sum() / num
+            return var.sqrt().clamp_min(1e-6)                              # scalar
+
+    def _masked_std_bias(
+        self,
+        b: torch.Tensor,            # (B,H,T,S)
+        attn_mask: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """유효 위치만으로 bias의 표준편차를 추정 (B,H,1,1)."""
+        b = b.float()
+        if attn_mask is None:
+            return b.std(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+        valid = (~attn_mask).float()                                      # (B,1,T,S)
+        vexp  = valid.expand(b.size(0), 1, b.size(2), b.size(3)).expand_as(b)  # (B,H,T,S)
+        num   = vexp.sum(dim=(-2, -1), keepdim=True).clamp_min(1.0)            # (B,H,1,1)
+        mu    = (b * vexp).sum(dim=(-2, -1), keepdim=True) / num
+        var   = (((b - mu)**2) * vexp).sum(dim=(-2, -1), keepdim=True) / num
+        return var.sqrt().clamp_min(1e-6)                                 # (B,H,1,1)
 
     def forward(
         self,
         q: torch.Tensor,  # (B,T,d_model)
         k: torch.Tensor,  # (B,S,d_model)
         v: torch.Tensor,  # (B,S,d_model)
-        attn_mask: Optional[torch.Tensor] = None,  # (B,1,T,S) True=mask
-        attn_bias: Optional[torch.Tensor] = None,  # (B,H,T,S) additive logit bias
+        attn_mask: Optional[torch.Tensor] = None,   # (B,1,T,S) True=mask
+        attn_bias: Optional[torch.Tensor] = None,   # (B,H,T,S) external bias (optional)
+        *,
+        pre_q: Optional[torch.Tensor] = None,       # align_source='preproj' 용
+        pre_k: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         B, T, _ = q.size(); S = k.size(1)
+
+        # projections
         qh = self._shape(self.q_proj(q))   # (B,H,T,dh)
         kh = self._shape(self.k_proj(k))   # (B,H,S,dh)
         vh = self._shape(self.v_proj(v))   # (B,H,S,dh)
 
+        # logits (pre)
         scores = torch.matmul(qh, kh.transpose(-2, -1)) / math.sqrt(self.d_head)  # (B,H,T,S)
+        scores = torch.nan_to_num(scores, nan=0.0, posinf=80.0, neginf=-80.0)
+        self.attn_pre = scores.detach()  # 원본(마스크 전) 스냅샷
 
-        if attn_bias is not None:
+        # --- 분산 스케일 추정: 유효 위치만 대상으로 ---
+        per_head_mode = (self.biaser is not None) and (
+            getattr(self.biaser.cfg, "per_head_scale", False) or getattr(self.biaser.cfg, "per_head_gate", False)
+        )
+        scores_std = self._masked_std_scores(scores, attn_mask, per_head=per_head_mode)  # scalar or (H,)
+
+        # --- ASCender bias 준비 ---
+        runtime_bias = None
+        if self.biaser is not None:
+            _pre_q = pre_q if pre_q is not None else q
+            _pre_k = pre_k if pre_k is not None else k
+            runtime_bias = self.biaser(qh, kh, pre_q=_pre_q, pre_k=_pre_k, scores_std=scores_std)
+        elif attn_bias is not None:
+            runtime_bias = attn_bias
+
+        if runtime_bias is not None:
+            runtime_bias = torch.nan_to_num(runtime_bias, nan=0.0, posinf=80.0, neginf=-80.0)
+            assert runtime_bias.shape == scores.shape, f"bias {runtime_bias.shape} vs scores {scores.shape}"
+
+            # (1) 마스크 영역 무효화(0) — 더하기 전에
+            if attn_mask is not None:
+                runtime_bias = runtime_bias.masked_fill(attn_mask, 0.0)
+
+            # (2) 표준화 + 목표 분산 매칭 (유효 위치 기준)
             with torch.no_grad():
-                # KL/엔트로피 변화를 살짝 체크
-                p0 = F.softmax(scores, dim=-1)                # bias 전
-                p1 = F.softmax(scores + attn_bias, dim=-1)    # bias 후 (가상)
-                delta = (p1 - p0).abs().mean().item()
-                if delta < 1e-5:
-                    print(f"[Warn] ASCender bias has near-zero effect: mean|Δp|={delta:.2e}")
+                if isinstance(scores_std, torch.Tensor):  # (H,)
+                    t_std = scores_std.view(1, -1, 1, 1).clamp_min(1e-6)
+                else:                                     # scalar
+                    t_std = torch.tensor(scores_std, device=scores.device, dtype=scores.dtype).view(1,1,1,1).clamp_min(1e-6)
+                b_std = self._masked_std_bias(runtime_bias, attn_mask)     # (B,H,1,1)
+                b_norm = runtime_bias / b_std
+                r = float(getattr(self, "std_match_ratio", 1.0))
+                target = r * t_std                                         # (1,H,1,1) or (1,1,1,1)
+                runtime_bias = b_norm * target
 
+            self.attn_bias = runtime_bias.detach()
 
-        if attn_bias is not None:
-            assert attn_bias.shape == scores.shape, f"bias {attn_bias.shape} vs scores {scores.shape}"
-            # 1) 적응적 리스케일 (분산 매칭)
-            s_std = scores.detach().float().std().clamp_min(1e-6)
-            b_std = attn_bias.detach().float().std().clamp_min(1e-6)
-            gamma = 0.3  # ← 효과가 ‘확실히’ 보이는 시작점 (0.1~0.5 사이 탐색)
-            attn_bias = attn_bias * (s_std / b_std) * gamma
+            # --- KL/프로브용: 같은 마스크 기준 스냅샷 ---
+            if attn_mask is not None:
+                pre_masked  = scores.masked_fill(attn_mask, torch.finfo(scores.dtype).min)
+                post_masked = (scores + runtime_bias).masked_fill(attn_mask, torch.finfo(scores.dtype).min)
+            else:
+                pre_masked  = scores
+                post_masked = scores + runtime_bias
+            self.attn_pre_masked  = pre_masked.detach()
+            self.attn_post_masked = post_masked.detach()
 
-            scores = scores + attn_bias
+            # 실제 적용
+            scores = post_masked
+        else:
+            self.attn_bias = None
+            # 마스크 정렬 스냅샷만 남김
+            if attn_mask is not None:
+                pre_masked = scores.masked_fill(attn_mask, torch.finfo(scores.dtype).min)
+            else:
+                pre_masked = scores
+            self.attn_pre_masked  = pre_masked.detach()
+            self.attn_post_masked = pre_masked.detach()
 
-        if attn_mask is not None:
-            minval = torch.finfo(scores.dtype).min  # half에서도 안전
-            scores = scores.masked_fill(attn_mask, minval)
-
-        scores = scores.clamp(-80, 80)  # 안정화
+        # clamp → softmax
+        scores = scores.clamp(-80, 80)
+        self.attn_logits = scores.detach()
 
         attn = F.softmax(scores, dim=-1)
         attn = self.dropout(attn)
+        self.attn_probs = attn.detach()
+
+        # merge heads
         out = torch.matmul(attn, vh).transpose(1, 2).contiguous().view(B, T, self.d_model)
         out = self.o_proj(out)
 
-        # for visualization & entropy tracing
         self.last_attn = attn.detach()
         return out, attn
 
@@ -189,19 +286,14 @@ class EncoderLayer(nn.Module):
         self.ffn = PositionwiseFFN(d_model, d_ff, dropout)
         self.dropout2 = nn.Dropout(dropout)
 
-        self.biaser = biaser  # AscenderBias per-layer (can be None)
+        self.biaser: Optional[AscenderBias] = biaser  # AscenderBias per-layer (can be None)
+        # 내부 경로로 단일화: MHA가 직접 bias 생성/적용
+        self.self_attn.biaser = self.biaser
 
     def forward(self, x: torch.Tensor, src_mask: Optional[torch.Tensor]) -> torch.Tensor:
         h = self.ln1(x)
-        attn_bias = None
-        if self.biaser is not None:
-            attn_bias = self.biaser(
-                qh=self.self_attn._shape(self.self_attn.q_proj(h)),
-                kh=self.self_attn._shape(self.self_attn.k_proj(h)),
-                pre_q=h, pre_k=h
-            )
-
-        attn_out, _ = self.self_attn(h, h, h, attn_mask=src_mask, attn_bias=attn_bias)
+        # 내부 biaser가 있으면 MHA가 softmax 직전에 직접 생성/적용
+        attn_out, _ = self.self_attn(h, h, h, attn_mask=src_mask, pre_q=h, pre_k=h)
         x = x + self.dropout1(attn_out)
 
         h2 = self.ln2(x)
@@ -226,8 +318,12 @@ class DecoderLayer(nn.Module):
         self.ffn = PositionwiseFFN(d_model, d_ff, dropout)
         self.dropout3 = nn.Dropout(dropout)
 
-        self.biaser_self = biaser_self
-        self.biaser_cross = biaser_cross
+        self.biaser_self: Optional[AscenderBias] = biaser_self
+        self.biaser_cross: Optional[AscenderBias] = biaser_cross
+
+        # 내부 경로로 단일화
+        self.self_attn.biaser = self.biaser_self
+        self.cross_attn.biaser = self.biaser_cross
 
     def forward(
         self,
@@ -238,26 +334,12 @@ class DecoderLayer(nn.Module):
     ) -> torch.Tensor:
         # Self-attention (causal + padding on target)
         h = self.ln1(x)
-        self_bias = None
-        if self.biaser_self is not None:
-            self_bias = self.biaser_self(
-                qh=self.self_attn._shape(self.self_attn.q_proj(h)),
-                kh=self.self_attn._shape(self.self_attn.k_proj(h)),
-                pre_q=h, pre_k=h
-            )
-        sa_out, _ = self.self_attn(h, h, h, attn_mask=tgt_mask, attn_bias=self_bias)
+        sa_out, _ = self.self_attn(h, h, h, attn_mask=tgt_mask, pre_q=h, pre_k=h)
         x = x + self.dropout1(sa_out)
 
         # Cross-attention (pad-masked on source)
         h2 = self.ln2(x)
-        cross_bias = None
-        if self.biaser_cross is not None:
-            cross_bias = self.biaser_cross(
-                qh=self.cross_attn._shape(self.cross_attn.q_proj(h2)),
-                kh=self.cross_attn._shape(self.cross_attn.k_proj(memory)),
-                pre_q=h2, pre_k=memory
-            )
-        ca_out, _ = self.cross_attn(h2, memory, memory, attn_mask=memory_mask, attn_bias=cross_bias)
+        ca_out, _ = self.cross_attn(h2, memory, memory, attn_mask=memory_mask, pre_q=h2, pre_k=memory)
         x = x + self.dropout2(ca_out)
 
         h3 = self.ln3(x)
@@ -391,6 +473,9 @@ class Transformer(nn.Module):
             tie_embeddings=cfg.tie_embeddings,
         )
 
+        self.decoder.layers[0].self_attn.std_match_ratio = 1.3  # L0 세게 (1.2~1.5 그리드)
+        self.decoder.layers[1].self_attn.std_match_ratio = 0.7  # L1 보조
+
         # === ASCender attachment policy ===
         if cfg.use_ascender:
             print(f"[Init] ASCender ON (additive). Attach policy: decoder self-attn first 2 layers only.")
@@ -400,6 +485,8 @@ class Transformer(nn.Module):
         # Encoder biaser (기본 OFF 권장)
         for i, layer in enumerate(self.encoder.layers):
             layer.biaser = AscenderBias(cfg.asc_cfg) if (cfg.use_ascender and cfg.asc_bias_enc) else None
+            # 내부 경로로 장착
+            layer.self_attn.biaser = layer.biaser
             if layer.biaser is not None:
                 print(f"[Encoder] Layer {i} — biaser attached")
 
@@ -407,13 +494,28 @@ class Transformer(nn.Module):
         for i, layer in enumerate(self.decoder.layers):
             if cfg.use_ascender and cfg.asc_bias_dec_self and (i < 2):
                 layer.biaser_self = AscenderBias(cfg.asc_cfg)
+                layer.self_attn.biaser = layer.biaser_self
                 print(f"[Decoder] Layer {i} — self-attn biaser attached")
             else:
                 layer.biaser_self = None
+                layer.self_attn.biaser = None
 
-            layer.biaser_cross = AscenderBias(cfg.asc_cfg) if (cfg.use_ascender and cfg.asc_bias_dec_cross) else None
-            if layer.biaser_cross is not None:
-                print(f"[Decoder] Layer {i} — cross-attn biaser attached")
+            if cfg.use_ascender and cfg.asc_bias_dec_cross:
+                # cross-attn은 과거제한이 없으므로 past_only=False 권장
+                cross_cfg = dataclasses.replace(cfg.asc_cfg, past_only=False)
+                layer.biaser_cross = AscenderBias(cross_cfg)
+                layer.cross_attn.biaser = layer.biaser_cross
+                print(f"[Decoder] Layer {i} — cross-attn biaser attached (past_only=False)")
+            else:
+                layer.biaser_cross = None
+                layer.cross_attn.biaser = None
+
+                # --- Attach probe to first decoder layer self-attn ---
+        if cfg.use_ascender and len(self.decoder.layers) > 0:
+            first = self.decoder.layers[0].self_attn
+            self.probe = AttnProbe("decoder.self_attn.layer0")
+            first.register_forward_hook(self.probe)
+            print("[Init] AttnProbe attached to decoder.layer0.self_attn")
 
         self._reset_parameters()
 
@@ -428,25 +530,6 @@ class Transformer(nn.Module):
     def forward(self, src: torch.Tensor, tgt_inp: torch.Tensor, return_attn: bool = False):
         memory, src_pad_mask = self.encoder(src)
         logits = self.decoder(tgt_inp, memory, src_pad_mask)
-
-        if self.cfg.use_ascender:
-            first_layer = self.decoder.layers[0]
-            if getattr(first_layer, "biaser_self", None) is not None and hasattr(first_layer.self_attn, "last_attn"):
-                with torch.no_grad():
-                    # 실제 통과한 h 사용
-                    # 직전 루프의 x를 훔칠 순 없으니 다시 한 번 얇게 태워서 뽑자
-                    B, T = tgt_inp.size()
-                    h = first_layer.ln1(self.decoder.tok_emb(tgt_inp) + self.decoder.pos_enc.pe[:T].unsqueeze(0).to(tgt_inp.device))
-                    qh = first_layer.self_attn._shape(first_layer.self_attn.q_proj(h))
-                    kh = first_layer.self_attn._shape(first_layer.self_attn.k_proj(h))
-                    scores = torch.matmul(qh, kh.transpose(-2, -1)) / math.sqrt(first_layer.self_attn.d_head)
-                    attn_bias = first_layer.biaser_self(qh, kh, pre_q=h, pre_k=h)
-
-                    print(f"[Debug] scores std={float(scores.std()):.4f} | bias std={float(attn_bias.std()):.4f} | "
-                        f"ratio={float(attn_bias.std()/(scores.std()+1e-6)):.3f}")
-                    bmean = float(attn_bias.mean()); bmin = float(attn_bias.min()); bmax = float(attn_bias.max())
-                    print(f"[Debug] bias stats — mean={bmean:.4f}, min={bmin:.4f}, max={bmax:.4f}")
-
 
         if return_attn:
             attn_maps = []
@@ -524,13 +607,51 @@ if __name__ == "__main__":
     tgt_inp = torch.randint(1, cfg.tgt_vocab_size, (B, T))
     tgt_out = torch.randint(1, cfg.tgt_vocab_size, (B, T))
 
-    crit = LabelSmoothingLoss(cfg.tgt_vocab_size, smoothing=0.1, ignore_index=cfg.pad_id)
+    crit = LabelSmoothingLoss(cfg.tgt_vocab_size, smoothing=0.05, ignore_index=cfg.pad_id)
     opt = torch.optim.AdamW(model.parameters(), lr=1.0, betas=(0.9, 0.98), eps=1e-9)
     sched = NoamLR(opt, d_model=cfg.d_model, warmup_steps=4000)
 
     logits = model(src, tgt_inp)        # (B,T,V)
     loss = crit(logits, tgt_out)
     loss.backward()
+
+    # grad 체크: 새(γ_log) / 옛(γ) 모두 호환
+    b = model.decoder.layers[0].biaser_self
+
+    if b is not None and hasattr(b, "gamma_log"):
+        g_eff_h = torch.exp(b.gamma_log.detach()).clamp(max=b.cfg.gamma_cap)  # (H,) or scalar
+        if g_eff_h.ndim > 0:
+            g_std = float(g_eff_h.std().item())
+        else:
+            g_std = 0.0
+        if getattr(b, "gate_param", None) is not None:
+            gr = torch.sigmoid(b.gate_param.detach())
+            g_raw = b.cfg.gate_floor + (1.0 - b.cfg.gate_floor) * gr
+            g_raw = torch.minimum(g_raw, torch.as_tensor(float(b.cfg.gate_ceiling), device=gr.device))
+            ggate_std = float(g_raw.std().item()) if g_raw.ndim > 0 else 0.0
+        else:
+            ggate_std = 0.0
+        print(f"[ASC headσ] γ.std={g_std:.3f} | gate.std={ggate_std:.3f}")
+
+    if b is not None:
+        grad_gamma_log = getattr(b, "gamma_log", None)
+        grad_gamma = getattr(b, "gamma", None)
+        if grad_gamma_log is not None and grad_gamma_log.grad is not None:
+            print("[Grad] d(log_gamma) mean =", float(grad_gamma_log.grad.mean()))
+        elif grad_gamma is not None and grad_gamma.grad is not None:
+            print("[Grad] d(gamma) mean =", float(grad_gamma.grad.mean()))
+        else:
+            print("[Grad] gamma grad = None")
+
+        if hasattr(b, "ema_ratio"):
+            gamma_eff = b.gamma_effective if hasattr(b, "gamma_effective") else (
+                float((b.gamma.mean() if hasattr(b, "gamma") else torch.tensor(0.0)).item())
+            )
+            gate_eff = b.gate_effective if hasattr(b, "gate_effective") else (
+                float(torch.sigmoid(b.gate_param).mean().item()) if hasattr(b, "gate_param") and b.gate_param is not None else None
+            )
+            print(f"[ASC] ratio(ema)={float(b.ema_ratio):.3f} | γ={gamma_eff:.3f} | gate={('None' if gate_eff is None else f'{gate_eff:.3f}')}")
+
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     opt.step(); sched.step()
     print("OK — forward/backward step works. Loss:", float(loss))
