@@ -1,5 +1,5 @@
 # ==========================================
-# ASCender Experiment Configuration (CLEAN)
+# ASCender Experiment Configuration (AGGRO • final)
 # ==========================================
 
 dataset:
@@ -10,7 +10,6 @@ dataset:
   num_workers: 2
   pin_memory: true
 
-# Transformer Attention Mode
 mode: additive
 
 experiment:
@@ -19,13 +18,12 @@ experiment:
   epochs: 3
   batch_size: 4
   lr: 0.0005
-  lr_asc: 0.002         # train.py에서 지원 (없으면 1e-3로 기본)
+  lr_asc: 0.0005
   warmup_steps: 200
   clip_grad: 0.8
   smoothing: 0.00
 
 model:
-  # ✔ dataset과 일치
   src_vocab_size: 30000
   tgt_vocab_size: 30000
 
@@ -43,49 +41,72 @@ model:
   asc_bias_dec_self: true
   asc_bias_dec_cross: false
 
+  # === Debug / Probes ===
+  # 0이면 스냅샷/프로브 비활성(권장). 디버깅 때만 200~500으로.
+  probe_every: 50
+
   asc_cfg:
-    # Plan A: cohesion + light alignment (Δp 살짝↑, 과개입 방지)
+    # Plan: cohesion + light alignment (Δp↑, 과개입 방지)
     use_alignment:  true
     use_separation: false
     use_cohesion:   true
 
-    # weights (Δp 소폭 상향)
-    w_align: 1.5
-    w_sep:   0.0
-    w_coh:   0.45
+    # weights (Δp 상향 유지)
+    w_align: 10.0
+    w_sep:   0.00
+    w_coh:   10.0
 
-    # kernels / options
+    # Positional kernels
     sigma_sep: 1.0
-    sigma_coh: 8.0
-    align_source: "qk"      # Plan B 전환 시 "preproj" 권장
-    temperature: 0.90
-    clamp_min: -2.5
-    clamp_max: 2.5
+    sigma_coh: 3.0
 
-    # directional & band-pass (중거리)
+    # Alignment options
+    align_source: "qk"
+    temperature: 1.0
+
+    # Stabilize pre-γ
+    clamp_min: -2.0
+    clamp_max:  2.0
+
+    # Directionality & band-pass
     past_only: true
-    band_min: 2
-    band_max: 32
+    band_min: 0
+    band_max: 48   # 필요시 None
 
     # per-head
     per_head_scale: true
-    per_head_gate:  true
+    per_head_gate:  false
 
     # scaling (γ) & gate (σ)
-    global_scale_init: 0.8
+    global_scale_init: 1.0
     use_gate: true
-    gate_init: -0.3          # ≈ 0.20 시작
-    gate_floor: 0.20         # 코멘트와 값 일치
-    gate_ceiling: 1.05       # 0.65 포화 탈출용(학습 중 필요 시 0.65로 회수)
+    gate_init: -0.6          # 초깃값 ≈ 0.35 부근
+    gate_floor: 0.35
+    gate_ceiling: 0.65       # 단일 소스 (train.py에서 재캡 금지)
 
-    # auto-calibration
+    # === ALiBi convex mix (ASC ⟷ ALiBi) ===
+    use_alibi_mix: true
+    alpha_start: 0.20         # 초반 ALiBi 비중↑(1-α)
+    alpha_end:   0.70         # 중반 이후 ASC 비중↑
+    alpha_schedule: "cosine"
+    alpha_total_steps: 1500    # 로더 총 step에 맞춰 필요시만 조정
+
+    # === Auto-calibration (Δp 타깃팅) ===
     use_auto_calibrate: true
-    target_ratio: 0.26       # 0.30 → 0.26 (안정적 Δp 상향)
-    calibrate_step_clamp_lo: 0.99
-    calibrate_step_clamp_hi: 1.01
-    ema_momentum: 0.80
+    target_ratio: 0.30         # L0 bias_ratio 타깃 (로그상 sweet spot 0.23~0.32)
+    calibrate_step_clamp_lo: 0.90
+    calibrate_step_clamp_hi: 1.12
+    ema_momentum: 0.90
 
-    # runtime safety / caps
-    hard_max_ratio: 0.60
-    hard_target_ratio: 0.30
-    gamma_cap: 3.5           # 코멘트와 값 일치(완만한 상한)
+    # === Runtime safety / caps ===
+    hard_max_ratio: 0.85       # 절대 상한(폭주 방지)
+    hard_target_ratio: 0.55    # 타깃 상한
+    gamma_min: 0.90
+    # gamma_max: 1.6             # 하나만 둠(중복 cap 제거)
+    gamma_cap: 6.0
+
+    # Symmetry break
+    jitter_std: 0.001
+
+    # batch std aggregation for bias scaling
+    std_batch_mean: true

@@ -1,9 +1,10 @@
 # ==========================================
-# ASCender Experiment Configuration (STABLE)
+# ASCender Experiment Configuration (AGGRESSIVE-STABLE)
+# Single source of truth for train.py / transformer.py / ascender_bias.py
 # ==========================================
 
 dataset:
-  name: "wikitext-2-v1"   # or "wikitext-103-v1"
+  name: "wikitext-2-v1"        # or "wikitext-103-v1"
   seq_len: 128
   batch_size: 8
   vocab_size: 30000
@@ -11,21 +12,22 @@ dataset:
   pin_memory: true
 
 # Transformer Attention Mode
-mode: additive   # ASCender는 softmax 이전 additive 전개
+mode: additive                 # ASCender uses additive bias before softmax
 
 experiment:
-  name: ascender_cohesion_stable
+  name: ascender_aggressive_stable
   seeds: [42, 43, 44]
   epochs: 10
   batch_size: 8
-  lr: 0.0005
+  lr: 0.0005                   # base model LR
+  lr_asc: 0.0005               # ASC params LR (kept constant by train.py)
   warmup_steps: 200
   clip_grad: 0.8
-  smoothing: 0.05
+  smoothing: 0.0
 
 model:
-  src_vocab_size: 1000
-  tgt_vocab_size: 1000
+  src_vocab_size: 30000
+  tgt_vocab_size: 30000
   d_model: 256
   n_heads: 8
   n_layers_enc: 3
@@ -34,66 +36,79 @@ model:
   dropout: 0.1
   pad_id: 0
 
-  # === ASCender Bias Settings ===
+  # === ASCender Bias Attachments ===
   use_ascender: true
-  asc_bias_enc: false            # encoder OFF 권장
-  asc_bias_dec_self: true        # decoder self-attn ON (코드상 하위 레이어에만 부착)
-  asc_bias_dec_cross: false      # cross-attn OFF 권장
+  asc_bias_enc: false            # encoder OFF (keeps training stable)
+  asc_bias_dec_self: true        # decoder self-attn ON (L0~L1 attached by code)
+  asc_bias_dec_cross: false      # cross-attn OFF (recommended)
 
+  # === Debug / Probes ===
+  # 0이면 스냅샷/프로브 비활성(권장). 디버깅 때만 200~500으로.
+  probe_every: 0
+
+  # === ASCender Bias Config ===
   asc_cfg:
-    # component switches (Plan A: cohesion only)
+    # ---- Components (A + C; S off for stability) ----
     use_alignment:  true
     use_separation: false
     use_cohesion:   true
 
-    # weights
-    w_align: 1.0
-    w_sep:   0.7
-    w_coh:   1.0
+    # ---- Component weights (pre-γ; direction shaping only) ----
+    # Magnitude is dominated by std-match ratio (r) in MHA; keep weights moderate.
+    w_align: 0.22
+    w_sep:   0.12
+    w_coh:   0.10
 
-    # kernels / options
+    # ---- Positional kernels ----
     sigma_sep: 1.0
-    sigma_coh: 4.0
-    align_source: "qk"     # Plan B 전환 시 "preproj" 권장
-    temperature: 0.75
-    clamp_min: -4.0
-    clamp_max: 4.0
+    sigma_coh: 3.0
 
-    # directional & band-pass (중거리)
+    # ---- Alignment options ----
+    align_source: "qk"           # (Plan B: "preproj" if you want embedding-level)
+    temperature: 1.0
+
+    # ---- Safety clamp before γ ----
+    clamp_min: -2.0
+    clamp_max: 2.0
+
+    # ---- Directionality & band-pass (focus on short/mid range) ----
     past_only: true
     band_min: 0
-    band_max: 24
+    band_max: 48
 
-    # per-head (유지) — 포화 방지 캡으로 이질성 확보
-    per_head_scale: true
-    per_head_gate:  true
+    # ---- Per-head heterogeneity (aggressive but safe) ----
+    per_head_scale: true         # learn per-head γ
+    per_head_gate:  false        # keep global gate for stability
 
-    # scaling (γ) & gate (σ)
-    global_scale_init: 1.2
+    # ---- Global scaling & gate ----
+    global_scale_init: 0.9       # higher initial γ for faster effect
     use_gate: true
-    gate_init: -1.4          # ≈ 0.20 시작
-    gate_floor: 0.35         # 0.20 -> 0.15 (바닥 소폭 낮춤)
-    gate_ceiling: 1.00
+    gate_init: -1.6              # slightly more open than default
+    gate_floor: 0.30
+    gate_ceiling: 0.65           # train.py will cap to 0.65 from epoch ≥ 2
 
-    # auto-calibration — 타깃 낮춰 과도 개방/증폭 방지
+    # ---- Auto-calibration (off to avoid fighting τ/r schedules) ----
     use_auto_calibrate: false
-    target_ratio: 0.22       # 0.14 -> 0.08 (현재 ratio≈0.126 < target이면 계속 키우던 문제 차단)
-    calibrate_step_clamp_lo: 0.98
-    calibrate_step_clamp_hi: 1.02
-    ema_momentum: 0.85
+    target_ratio: 0.45
+    calibrate_step_clamp_lo: 0.90
+    calibrate_step_clamp_hi: 1.12
+    ema_momentum: 0.90
 
-    # runtime safety / caps
-    hard_max_ratio: 0.75
-    hard_target_ratio: 0.35
-    gamma_cap: 4.0           # 2.5 -> 1.2 (γ 상한 축소로 포화 방지)
-    
+    # ---- Runtime safety caps ----
+    hard_max_ratio: 0.85         # allow stronger bias before hard limit
+    hard_target_ratio: 0.55
+    gamma_min: 0.25
+    gamma_cap: 6.0               # matches MHA bias_softcap; aggressive but bounded
 
-# ==========================================
-# Notes:
-# - Plan B(정렬만) 시험하려면 아래 4줄만 바꾸고 나머지는 유지:
-#     use_alignment: true
-#     use_cohesion:  false
-#     w_align: 1.30
-#     align_source: "preproj"  # + temperature: 0.90 권장
-# - Plan B에서는 target_ratio: 0.14, per_head_*: true 그대로 OK
-# ==========================================
+    # ---- Symmetry break ----
+    jitter_std: 1e-3
+
+    # ---- ALiBi convex mix (keep fixed) ----
+    use_alibi_mix: false
+    alpha_start: 0.85
+    alpha_end: 0.90
+    alpha_schedule: "cosine"       # fixed α for simplicity
+    alpha_total_steps: 2000
+
+    # ---- Batch std aggregation for scaling upstream ----
+    std_batch_mean: true

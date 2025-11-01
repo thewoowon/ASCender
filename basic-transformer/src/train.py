@@ -1,38 +1,51 @@
-# train.py (clean & robust)
+# train.py
+# (clean, DRIFT-safe, single-source YAML config, τ-schedule, Δp/KL logging)
 
+import os
 import csv
 import math
-import os
-import argparse
 import yaml
-import torch
+import argparse
 import importlib
 from datetime import datetime
 from types import SimpleNamespace
-from src.utils.sched_ascender import (
-    ascender_layerwise_r,
-    ascender_layerwise_extra,
-    keep_delta_p_band,
-)
 
-# === optional: non-interactive backend (server/CLI)
+import torch
+
+# ---- Optional helpers (graceful fallback if utils are absent) ----
+try:
+    from src.utils.sched_ascender import (
+        ascender_layerwise_r,
+        ascender_layerwise_extra,
+        keep_delta_p_band,
+    )
+except Exception:
+    def ascender_layerwise_r(*a, **k): ...
+    def ascender_layerwise_extra(*a, **k): ...
+    def keep_delta_p_band(*a, **k): ...
+
+# ---- Matplotlib (offscreen) for bias heatmaps ----
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-# -----------------------------
-# IO / Config / Device
-# -----------------------------
+# ============================================================
+# Loader / Device / I/O
+# ============================================================
 
 def load_transformer(mode: str):
+    """
+    Dynamically load the additive (ASCender) or multiplicative variant
+    without branching elsewhere in training code.
+    """
     if mode == "multiplicative":
-        module = importlib.import_module("src.models.multiplicative_transformer")
+        m = importlib.import_module("src.models.multiplicative_transformer")
     elif mode == "additive":
-        module = importlib.import_module("src.models.transformer")
+        m = importlib.import_module("src.models.transformer")
     else:
         raise ValueError(f"Unknown mode: {mode}")
-    return module.Transformer, module.TransformerConfig, module.LabelSmoothingLoss, module.NoamLR
+    return m.Transformer, m.TransformerConfig, m.LabelSmoothingLoss, m.NoamLR
 
 
 def load_config(path: str):
@@ -40,16 +53,15 @@ def load_config(path: str):
         return yaml.safe_load(f)
 
 
-def get_device():
+def get_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
-    elif torch.backends.mps.is_available():
+    if torch.backends.mps.is_available():
         return torch.device("mps")
-    else:
-        return torch.device("cpu")
+    return torch.device("cpu")
 
 
-def log_result(csv_path, fields):
+def log_result(csv_path: str, fields: dict):
     header = ["timestamp", "mode", "use_ascender", "bias_combo", "seed", "epoch", "avg_loss"]
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
     newfile = not os.path.exists(csv_path)
@@ -60,61 +72,158 @@ def log_result(csv_path, fields):
         w.writerow(fields)
 
 
-# -----------------------------
-# AB check (Ascender ON vs OFF)
-# -----------------------------
+# ============================================================
+# τ schedule & Attention metrics
+# ============================================================
+
+def cosine_tau(step: int, total_steps: int, start_tau: float, end_tau: float) -> float:
+    if total_steps <= 0:
+        return float(start_tau)
+    t = min(max(step, 0) / float(total_steps), 1.0)
+    return float(end_tau + 0.5 * (start_tau - end_tau) * (1 + math.cos(math.pi * t)))
+
+
+def apply_tau_to_asc_heads(model, tau: float):
+    """
+    Apply τ to decoder self-attn heads where ASCender is attached (L0, L1).
+    """
+    if not hasattr(model, "decoder"):
+        return
+    layers = getattr(model.decoder, "layers", [])
+    for li in (0, 1):
+        if li < len(layers):
+            mha = layers[li].self_attn
+            if hasattr(mha, "attn_temperature"):
+                mha.attn_temperature = float(tau)
+
+
+@torch.no_grad()
+def _safe_softmax(x: torch.Tensor) -> torch.Tensor:
+    x = torch.nan_to_num(x, nan=-1e9, posinf=80.0, neginf=-80.0).clamp(-80, 80)
+    return torch.softmax(x, dim=-1)
+
+
+@torch.no_grad()
+def collect_attn_metrics(model) -> dict:
+    """
+    Uses MHA snapshots (attn_pre_masked / attn_post_masked) captured inside
+    the forward pass to compute mean Δp and mean KL across L0/L1 decoder self-attn.
+    """
+    deltas, kls = [], []
+    if not hasattr(model, "decoder"):
+        return {"delta_p_mean": 0.0, "kl_mean": 0.0}
+
+    for li in (0, 1):
+        if li >= len(model.decoder.layers):
+            continue
+        mha = model.decoder.layers[li].self_attn
+        pre = getattr(mha, "attn_pre_masked", None)
+        post = getattr(mha, "attn_post_masked", None)
+        if pre is None or post is None:
+            continue
+
+        p0, p1 = _safe_softmax(pre.float()), _safe_softmax(post.float())
+        deltas.append(torch.mean(torch.abs(p1 - p0)).item())
+
+        eps = 1e-8
+        kls.append(torch.mean((p1 + eps) * (torch.log(p1 + eps) - torch.log(p0 + eps))).item())
+
+    if not deltas:
+        return {"delta_p_mean": 0.0, "kl_mean": 0.0}
+    return {
+        "delta_p_mean": float(sum(deltas) / len(deltas)),
+        "kl_mean": float(sum(kls) / len(kls)),
+    }
+
+
+# ============================================================
+# DRIFT suppressor: sync expected <- current (once per epoch)
+# ============================================================
+
+def sync_expected_to_runtime(model):
+    """
+    Overwrite biaser.expected_* with current runtime hyper-params to suppress
+    one-off DRIFT warnings. Call after applying YAML/schedules.
+    """
+    if not hasattr(model, "decoder"):
+        return
+    for li in (0, 1):
+        if li >= len(model.decoder.layers):
+            continue
+        b = getattr(model.decoder.layers[li], "biaser_self", None)
+        a = model.decoder.layers[li].self_attn if li < len(model.decoder.layers) else None
+        if b is None or a is None:
+            continue
+        # copy current runtime → expected_*
+        mappings = [
+            ("expected_tau", getattr(a, "attn_temperature", None)),
+            ("expected_topk", getattr(a, "sparsify_k_frac", None)),
+            ("expected_r", getattr(a, "std_match_ratio", None)),
+            ("expected_v_eps", getattr(a, "value_eps", None) if hasattr(a, "value_eps") else getattr(a, "v_gain_epsilon", None)),
+        ]
+        for name, cur in mappings:
+            if cur is not None and hasattr(b, name):
+                setattr(b, name, float(cur))
+        # optionally disable repeated drift warnings if config supports it
+        if hasattr(b, "cfg") and hasattr(b.cfg, "enable_drift_warn"):
+            b.cfg.enable_drift_warn = False
+
+
+# ============================================================
+# A/B quick check (bias ON vs OFF) — diagnostic only
+# ============================================================
 
 @torch.no_grad()
 def quick_ab_check(model, batch, device):
     was_training = model.training
     model.eval()
-
     src, tgt_inp, tgt_out = (x.to(device) for x in batch)
 
-    # === A) ASC ON ===
     logits_on = model(src, tgt_inp)
 
-    # === B) ASC OFF ===
     keep = []
     for l in model.decoder.layers:
-        sa = getattr(l, "self_attn", None)
-        ca = getattr(l, "cross_attn", None)
-        keep.append((
-            getattr(sa, "biaser", None), getattr(l, "biaser_self", None),
-            getattr(ca, "biaser", None), getattr(l, "biaser_cross", None),
-        ))
-        if sa is not None: setattr(sa, "biaser", None)
-        if hasattr(l, "biaser_self"): setattr(l, "biaser_self", None)
-        if ca is not None: setattr(ca, "biaser", None)
-        if hasattr(l, "biaser_cross"): setattr(l, "biaser_cross", None)
+        sa, ca = getattr(l, "self_attn", None), getattr(l, "cross_attn", None)
+        keep.append((getattr(sa, "biaser", None), getattr(l, "biaser_self", None),
+                     getattr(ca, "biaser", None), getattr(l, "biaser_cross", None)))
+        if sa is not None:
+            setattr(sa, "biaser", None)
+        if hasattr(l, "biaser_self"):
+            setattr(l, "biaser_self", None)
+        if ca is not None:
+            setattr(ca, "biaser", None)
+        if hasattr(l, "biaser_cross"):
+            setattr(l, "biaser_cross", None)
 
-    # 내부 스냅샷/캐시 제거 (공정 비교)
+    # clear snapshots so "off" path is clean
     for l in model.decoder.layers:
         for a in ("self_attn", "cross_attn"):
             mha = getattr(l, a, None)
             if mha is None:
                 continue
-            for fld in (
-                "attn_pre", "attn_pre_masked", "attn_post_masked",
-                "attn_bias", "attn_logits", "attn_probs", "last_attn"
-            ):
+            for fld in ("attn_pre", "attn_pre_masked", "attn_post_masked",
+                        "attn_bias", "attn_logits", "attn_probs", "last_attn"):
                 if hasattr(mha, fld):
                     setattr(mha, fld, None)
 
     logits_off = model(src, tgt_inp)
 
-    # 복구
+    # restore
     for l, (sa_b, l_sa_b, ca_b, l_ca_b) in zip(model.decoder.layers, keep):
-        if hasattr(l, "self_attn"):  setattr(l.self_attn,  "biaser", sa_b)
-        if hasattr(l, "biaser_self"): setattr(l, "biaser_self", l_sa_b)
-        if hasattr(l, "cross_attn"): setattr(l.cross_attn, "biaser", ca_b)
-        if hasattr(l, "biaser_cross"): setattr(l, "biaser_cross", l_ca_b)
+        if hasattr(l, "self_attn"):
+            setattr(l.self_attn, "biaser", sa_b)
+        if hasattr(l, "biaser_self"):
+            setattr(l, "biaser_self", l_sa_b)
+        if hasattr(l, "cross_attn"):
+            setattr(l.cross_attn, "biaser", ca_b)
+        if hasattr(l, "biaser_cross"):
+            setattr(l, "biaser_cross", l_ca_b)
 
-    # === NLL ===
-    logp_on  = torch.log_softmax(logits_on.float(), dim=-1)
+    # NLL compare (token level on tgt_out != pad)
+    logp_on = torch.log_softmax(logits_on.float(), dim=-1)
     logp_off = torch.log_softmax(logits_off.float(), dim=-1)
     idx = tgt_out != model.cfg.pad_id
-    nll_on  = -logp_on.gather(-1, tgt_out.unsqueeze(-1)).squeeze(-1)[idx].mean().item()
+    nll_on = -logp_on.gather(-1, tgt_out.unsqueeze(-1)).squeeze(-1)[idx].mean().item()
     nll_off = -logp_off.gather(-1, tgt_out.unsqueeze(-1)).squeeze(-1)[idx].mean().item()
     print(f"[AB] NLL on={nll_on:.4f} | off={nll_off:.4f}")
 
@@ -122,93 +231,83 @@ def quick_ab_check(model, batch, device):
         model.train()
 
 
-# -----------------------------
-# Training
-# -----------------------------
+# ============================================================
+# One training epoch
+# ============================================================
 
-def run_epoch(model, data_loader, optimizer, scheduler, criterion, device, clip_grad: float, epoch_idx=None, ASC_IDX=2):
+def run_epoch(model, data_loader, optimizer, scheduler, criterion, device, clip_grad, epoch_idx=None, ASC_IDX=2):
     model.train()
-    total_loss, valid_steps = 0.0, 0
-    LOG_EVERY = 10
+    total_loss, steps = 0.0, 0
+    LOG_EVERY = 100
 
-    total_steps = len(data_loader) if hasattr(data_loader, "__len__") else 1000
+    if not hasattr(model, "_global_step"):
+        model._global_step = 0
+    if not hasattr(model, "_total_steps_all"):
+        model._total_steps_all = len(data_loader) if hasattr(data_loader, "__len__") else 1000
+
+    # epoch start: apply τ-snapshot and sync DRIFT expectations
+    if getattr(model.cfg, "use_ascender", False):
+        tau0 = cosine_tau(model._global_step, model._total_steps_all, 1.0, 1.10)
+        apply_tau_to_asc_heads(model, tau0)
+        sync_expected_to_runtime(model)
 
     for step, batch in enumerate(data_loader, 1):
-        if step <= 1500:
-            u = step / 1500.0
-            # L0: 1.9 -> 1.2
-            t0 = 1.9 + (1.2 - 1.9) * u
-            # L1: 1.30 -> 1.10
-            t1 = 1.30 + (1.10 - 1.30) * u
-            try:
-                model.decoder.layers[0].self_attn.attn_temperature = float(t0)
-                model.decoder.layers[1].self_attn.attn_temperature = float(t1)
-            except Exception:
-                pass
+        # τ schedule per step (aggressive but monotone)
+        if getattr(model.cfg, "use_ascender", False):
+            tau = cosine_tau(model._global_step, model._total_steps_all, 1.00, 1.10)
+            apply_tau_to_asc_heads(model, tau)
 
+        # 1-time wire print for quick sanity
         if step == 1 and getattr(model.cfg, "use_ascender", False):
             for li in range(min(2, len(model.decoder.layers))):
                 m = model.decoder.layers[li].self_attn
-                print(
-                    f"[ASC wire][L{li}] biaser={type(m.biaser).__name__ if m.biaser is not None else None}, "
-                    f"r={getattr(m, 'std_match_ratio', None)}, "
-                    f"tau={getattr(m, 'attn_temperature', None)}, "
-                    f"topk={getattr(m, 'sparsify_k_frac', None)}"
-                )
+                print(f"[ASC wire][L{li}] biaser={type(m.biaser).__name__ if m.biaser else None}, "
+                      f"r={getattr(m,'std_match_ratio',None)}, "
+                      f"tau={getattr(m,'attn_temperature',None)}, "
+                      f"topk={getattr(m,'sparsify_k_frac',None)}")
 
-        src, tgt_inp, tgt_out = batch
-        src, tgt_inp, tgt_out = src.to(device), tgt_inp.to(device), tgt_out.to(device)
-
+        src, tgt_inp, tgt_out = (t.to(device) for t in batch)
         optimizer.zero_grad(set_to_none=True)
+
         logits = model(src, tgt_inp)
         if torch.isnan(logits).any():
-            print(f"⚠️ NaN logits at step {step}")
+            print("⚠️ NaN logits — skipping step")
+            model._global_step += 1
             continue
 
         loss = criterion(logits, tgt_out)
         if torch.isnan(loss) or torch.isinf(loss):
-            print(f"⚠️ NaN/Inf loss at step {step}")
+            print("⚠️ NaN/Inf loss — skipping step")
+            model._global_step += 1
             continue
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
-
-        # 스케줄러는 모든 group에 적용되므로, step 후 ASC LR를 고정으로 되돌림(원하면)
         optimizer.step()
         scheduler.step()
 
-        if step % 100 == 0 and getattr(model.cfg, "use_ascender", False):
-            # L0: mean|Δp| 타깃을 살짝↑
-            keep_delta_p_band(model, layer_idx=0, target=0.0045, tol=0.0007,
-                            up=1.08, down=0.97, r_min=0.2, r_max=3.00)
-            # L1: 약하게
-            keep_delta_p_band(model, layer_idx=1, target=0.0025, tol=0.0005,
-                            up=1.06, down=0.98, r_min=0.2, r_max=2.2)
+        # Optional Δp control (kept OFF by default)
+        # if step % 100 == 0 and getattr(model.cfg, "use_ascender", False):
+        #     keep_delta_p_band(model, layer_idx=0, target=0.0120, tol=0.0020, up=1.12, down=0.96, r_min=0.5, r_max=30.0)
+        #     keep_delta_p_band(model, layer_idx=1, target=0.0070, tol=0.0015, up=1.10, down=0.97, r_min=0.4, r_max=12.0)
 
+        # Keep ASC LR constant (if user set a separate lr_asc)
         if hasattr(model, "_asc_lr") and ASC_IDX < len(optimizer.param_groups):
-            optimizer.param_groups[ASC_IDX]["lr"] = model._asc_lr  # ASC 고정 LR
+            optimizer.param_groups[ASC_IDX]["lr"] = model._asc_lr
 
         total_loss += float(loss.detach())
-        valid_steps += 1
-
-        if step % 100 == 0:
-            g_gamma, g_gate = [], []
-            for l in model.decoder.layers:
-                b = getattr(l, "biaser_self", None)
-                if b is None:
-                    b = getattr(l.self_attn, "biaser", None) if hasattr(l, "self_attn") else None
-                if b is None:
-                    continue
-                if getattr(b, "gamma_log", None) is not None and b.gamma_log.grad is not None:
-                    g_gamma.append(b.gamma_log.grad.abs().mean().item())
-                if getattr(b, "gate_param", None) is not None and b.gate_param.grad is not None:
-                    g_gate.append(b.gate_param.grad.abs().mean().item())
-            print(f"[ASC grad] gamma={(sum(g_gamma)/len(g_gamma)) if g_gamma else 0:.3e}, "
-                  f"gate={(sum(g_gate)/len(g_gate)) if g_gate else 0:.3e}")
-            print("[LR]", [pg["lr"] for pg in optimizer.param_groups])
+        steps += 1
+        model._global_step += 1
 
         if step % LOG_EVERY == 0:
-            print(f"Step {step:03d} | Loss {float(loss):.4f}")
+            metrics = {}
+            try:
+                metrics = collect_attn_metrics(model)
+            except Exception:
+                pass
+            print(f"Step {step:03d} | Loss {float(loss):.4f} | Δp={metrics.get('delta_p_mean', 0.0):.4f} "
+                  f"KL={metrics.get('kl_mean', 0.0):.4f}")
+            # mini AB diagnostic
             quick_ab_check(model, (src, tgt_inp, tgt_out), device)
 
             # Head-wise 상태
@@ -267,76 +366,95 @@ def run_epoch(model, data_loader, optimizer, scheduler, criterion, device, clip_
                           f"γ={('None' if gamma_eff is None else f'{gamma_eff:.3f}')} | "
                           f"gate={('None' if gate_eff is None else f'{gate_eff:.3f}')}")
 
-    avg_loss = total_loss / max(valid_steps, 1)
+    avg_loss = total_loss / max(steps, 1)
 
-    # Heatmap (optional)
+    # Save bias heatmap for L0 at epoch end (if ASC enabled)
     if getattr(model.cfg, "use_ascender", False) and (epoch_idx is not None):
         try:
             os.makedirs("logs/heatmaps", exist_ok=True)
             first_layer = model.decoder.layers[0]
             if getattr(first_layer, "biaser_self", None) is not None:
                 T = 20
-                h = torch.zeros((1, T, model.cfg.d_model), device=device, dtype=torch.float32)
+                h = torch.randn((1, T, model.cfg.d_model), device=device, dtype=torch.float32) * 0.01
                 qh = first_layer.self_attn._shape(first_layer.self_attn.q_proj(h))
                 kh = first_layer.self_attn._shape(first_layer.self_attn.k_proj(h))
                 bias = first_layer.biaser_self(qh, kh, pre_q=h, pre_k=h)[0, 0].detach().cpu()
-
                 plt.figure(figsize=(5, 4))
                 im = plt.imshow(bias, cmap="coolwarm", interpolation="nearest")
                 plt.colorbar(im, label="Bias Value")
                 plt.title(f"Decoder[0] Self-Attn Bias (Epoch {epoch_idx})")
-                plt.xlabel("Key Position"); plt.ylabel("Query Position")
-                plt.tight_layout()
-                save_path = f"logs/heatmaps/bias_epoch_{epoch_idx:02d}.png"
-                plt.savefig(save_path); plt.close()
-                print(f"[Saved] Bias heatmap → {save_path}")
+                plt.xlabel("Key"); plt.ylabel("Query"); plt.tight_layout()
+                sp = f"logs/heatmaps/bias_epoch_{epoch_idx:02d}.png"
+                plt.savefig(sp); plt.close()
+                print(f"[Saved] Bias heatmap → {sp}")
         except Exception as e:
             print(f"[Warning] Heatmap save failed: {e}")
 
     return avg_loss
 
 
-# -----------------------------
+# ============================================================
 # Main
-# -----------------------------
+# ============================================================
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
     args = parser.parse_args()
 
-    cfg_raw = load_config(args.config)
-    cfg_raw = SimpleNamespace(**cfg_raw)
-    cfg_raw.dataset = SimpleNamespace(**cfg_raw.dataset)
-    cfg_raw.experiment = SimpleNamespace(**cfg_raw.experiment)
-    cfg_raw.model = SimpleNamespace(**cfg_raw.model)
-    cfg_raw.model.asc_cfg = SimpleNamespace(**cfg_raw.model.asc_cfg)
+    raw = load_config(args.config)
 
-    exp_cfg = cfg_raw.experiment
-    seeds = getattr(exp_cfg, "seeds", [42])
-    mode = getattr(cfg_raw, "mode", "additive")
+    # SimpleNamespace builder with defaults
+    def ns(d, defaults=None):
+        d = {} if d is None else d
+        if defaults:
+            for k, v in defaults.items():
+                d.setdefault(k, v)
+        return SimpleNamespace(**d)
 
-    Transformer, TransformerConfig, LabelSmoothingLoss, NoamLR = load_transformer(mode)
+    cfg = ns(raw)
+    cfg.dataset = ns(getattr(cfg, "dataset", None))
+    cfg.experiment = ns(getattr(cfg, "experiment", None))
+    cfg.model = ns(getattr(cfg, "model", None))
+    cfg.model.asc_cfg = ns(getattr(cfg.model, "asc_cfg", None))
+
+    # Global defaults
+    cfg.mode = getattr(cfg, "mode", "additive")
+    cfg.experiment.seeds = getattr(cfg.experiment, "seeds", [42])
+    cfg.experiment.epochs = getattr(cfg.experiment, "epochs", 3)
+    cfg.experiment.lr = float(getattr(cfg.experiment, "lr", 5e-4))
+    cfg.experiment.lr_asc = float(getattr(cfg.experiment, "lr_asc", cfg.experiment.lr))
+    cfg.experiment.warmup_steps = int(getattr(cfg.experiment, "warmup_steps", 200))
+    cfg.experiment.clip_grad = float(getattr(cfg.experiment, "clip_grad", 0.8))
+    cfg.experiment.smoothing = float(getattr(cfg.experiment, "smoothing", 0.05))
+
+    Transformer, TransformerConfig, LabelSmoothingLoss, NoamLR = load_transformer(cfg.mode)
+
+    # Build AscenderBias Config object explicitly to ensure type-correct init
     from src.models.ascender_bias import AscenderBiasConfig
-    asc_cfg_obj = AscenderBiasConfig(**vars(cfg_raw.model.asc_cfg))
+    asc_cfg_obj = AscenderBiasConfig(**vars(cfg.model.asc_cfg))
 
-    model_kwargs = vars(cfg_raw.model).copy()
+    # 타입/범위 정리
+    if hasattr(asc_cfg_obj, "coerce"):
+        asc_cfg_obj.coerce()
+
+    model_kwargs = vars(cfg.model).copy()
     model_kwargs["asc_cfg"] = asc_cfg_obj
     model_cfg = TransformerConfig(**model_kwargs)
 
     device = get_device()
     print(f"[Device] {device}")
 
-    csv_path = "logs/results_summary.csv"
     os.makedirs("logs", exist_ok=True)
+    csv_path = "logs/results_summary.csv"
 
-    # Data
+    # ---- Data (try real dataloader, else dummy) ----
     try:
         from src.data.wikitext_loader import get_dataloader
-        train_loader, _ = get_dataloader(cfg_raw, split="train")
+        train_loader, _ = get_dataloader(cfg, split="train")
     except Exception as e:
-        print(f"[WARN] get_dataloader failed ({e}). Falling back to dummy data.")
-        def make_dummy_data(vocab_size: int, pad_id: int, batch_size: int, seq_len: int = 20, num_batches: int = 64):
+        print(f"[WARN] get_dataloader failed ({e}). Using dummy data.")
+        def make_dummy(vocab_size, pad_id, batch_size, seq_len=20, num_batches=64):
             for _ in range(num_batches):
                 src = torch.randint(1, vocab_size, (batch_size, seq_len))
                 tgt_inp = torch.randint(1, vocab_size, (batch_size, seq_len))
@@ -345,74 +463,45 @@ def main():
                 tgt_inp[:, -1] = pad_id
                 tgt_out[:, -1] = pad_id
                 yield (src, tgt_inp, tgt_out)
-        bs = cfg_raw.dataset.batch_size
-        vs = cfg_raw.dataset.vocab_size
-        pad = model_cfg.pad_id
-        train_loader = list(make_dummy_data(vs, pad, bs, seq_len=cfg_raw.dataset.seq_len, num_batches=64))
+
+        bs = int(getattr(cfg.dataset, "batch_size", 16))
+        vs = int(getattr(cfg.dataset, "vocab_size", 30000))
+        pad = int(getattr(model_cfg, "pad_id", 0))
+        sl = int(getattr(cfg.dataset, "seq_len", 128))
+        train_loader = list(make_dummy(vs, pad, bs, seq_len=sl, num_batches=64))
 
     all_losses = []
 
-    for seed in seeds:
+    # ---- Multi-seed loop ----
+    for seed in cfg.experiment.seeds:
         torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
         print("\n==============================")
         print(f"🚀 Starting training for seed={seed}")
         print("==============================")
 
         model = Transformer(model_cfg).to(device)
 
-        # ★ 여기서 YAML 설정을 존중한다: (덮어쓰기 금지)
-        #   - use_auto_calibrate, use_gate 등을 강제로 끄지 않음
-        #   - 단, MHA 튜닝(r/τ/topk)은 필요 시만 지정
-        try:
-            m0 = model.decoder.layers[0].self_attn
-            m1 = model.decoder.layers[1].self_attn
+        total_steps_all = (len(train_loader) * cfg.experiment.epochs) if hasattr(train_loader, "__len__") else 0
+        setattr(model, "_total_steps_all", int(total_steps_all))
+        setattr(model, "_global_step", 0)
 
-            # --- L0: r 살짝 상향, τ는 약간 낮춰 포화 완화(=스코어 영향↑) ---
-            m0.std_match_ratio = getattr(m0, "std_match_ratio", 2.2)  # was ~2.0
-            m0.attn_temperature = getattr(m0, "attn_temperature", 1.9)  # was ~2.2
-            m0.sparsify_k_frac = getattr(m0, "sparsify_k_frac", 0.30)   # 유지
-
-            # --- L1: r 소폭↑, τ 살짝↓, 희소화 약하게 ON ---
-            m1.std_match_ratio = getattr(m1, "std_match_ratio", 1.55)  # was ~1.4
-            m1.attn_temperature = getattr(m1, "attn_temperature", 1.30) # was ~1.4
-            m1.sparsify_k_frac = getattr(m1, "sparsify_k_frac", 0.05)   # was 0.10 유지(없으면 켬)
-        except Exception:
-            pass
-
-        # === Plan-B wiring override: use L0 only, disable L1 biaser ===
-        try:
-            # L0는 그대로(정렬 전용이면 L0만 씀)
-            if len(model.decoder.layers) >= 1:
-                l0 = model.decoder.layers[0]
-                if getattr(l0, "biaser_self", None) is not None:
-                    l0.self_attn.biaser = l0.biaser_self  # 확실히 self_attn 경로에 부착
-
-            # L1 biaser 완전 비활성화 (모듈 속성 + MHA 경로 둘 다)
-            if len(model.decoder.layers) >= 2:
-                l1 = model.decoder.layers[1]
-                l1.biaser_self = None
-                l1.self_attn.biaser = None
-                # 혹시 모를 cross 경로도 확실히 OFF
-                if hasattr(l1, "biaser_cross"):
-                    l1.biaser_cross = None
-                if hasattr(l1, "cross_attn"):
-                    l1.cross_attn.biaser = None
-        except Exception:
-            pass
-
-        # 배선 검증 (있으면)
+        # Wiring verification (optional)
         try:
             from src.utils.debug_ascender import verify_ascender_wiring
-            verify_ascender_wiring(model)
+            # verify_ascender_wiring(model)
+            pass
         except Exception as _e:
             print("[ASC VERIFY] skipped:", _e)
 
-        # Optimizer: [0]=main_decay, [1]=main_no_decay, [2]=asc (wd=0, lr 별도)
+        # ---- Optimizer param groups (LN/bias no-decay; ASC separate LR) ----
         main_decay, main_nodc, asc_params = [], [], []
         for n, p in model.named_parameters():
             if not p.requires_grad:
                 continue
-            is_asc = any(k in n for k in ["biaser", "gamma_log", "gate_param", "wA", "wS", "wC"])
+            is_asc = any(k in n for k in ["biaser", "gamma_log", "gate_param"])
             if is_asc:
                 asc_params.append(p)
             else:
@@ -420,59 +509,61 @@ def main():
                 is_bias = n.endswith(".bias")
                 (main_nodc if (is_ln or is_bias) else main_decay).append(p)
 
-        lr_base = float(exp_cfg.lr)
-        lr_asc  = float(getattr(exp_cfg, "lr_asc", lr_base))  # 필요하면 별도 튜닝
+        lr_base = float(cfg.experiment.lr)
+        lr_asc = float(cfg.experiment.lr_asc)
+
         optimizer = torch.optim.AdamW(
             [
                 {"params": main_decay, "lr": lr_base, "weight_decay": 0.01},
-                {"params": main_nodc, "lr": lr_base, "weight_decay": 0.00},
+                {"params": main_nodc,  "lr": lr_base, "weight_decay": 0.00},
                 {"params": asc_params, "lr": lr_asc,  "weight_decay": 0.00},
             ],
             betas=(0.9, 0.98), eps=1e-9
         )
         model._asc_lr = lr_asc
-        scheduler = NoamLR(optimizer, d_model=model_cfg.d_model, warmup_steps=exp_cfg.warmup_steps)
-        criterion = LabelSmoothingLoss(model_cfg.tgt_vocab_size, exp_cfg.smoothing, ignore_index=model_cfg.pad_id)
 
-        # Bias 조합 태그
+        scheduler = NoamLR(optimizer, d_model=model_cfg.d_model, warmup_steps=cfg.experiment.warmup_steps)
+        criterion = LabelSmoothingLoss(model_cfg.tgt_vocab_size, cfg.experiment.smoothing, ignore_index=model_cfg.pad_id)
+
+        # bias combo tag for CSV logging
         asc = model_cfg.asc_cfg
         combo = []
         def on(flag, w):
             return getattr(asc, flag, True) and float(getattr(asc, w, 0.0)) != 0.0
         if on("use_alignment", "w_align"): combo.append("A")
         if on("use_separation", "w_sep"):  combo.append("S")
-        if on("use_cohesion",   "w_coh"):  combo.append("C")
+        if on("use_cohesion", "w_coh"):    combo.append("C")
         bias_combo = "+".join(combo) if combo else "None"
 
-        for epoch in range(1, exp_cfg.epochs + 1):
-            # 필요하면 epoch-based anneal을 켤 수 있음 (지금은 보수적 기본 유지)
-            # if hasattr(asc, "target_ratio"):
-            #     if epoch >= 8:  model.cfg.asc_cfg.target_ratio = 0.26
-            #     elif epoch >= 5: model.cfg.asc_cfg.target_ratio = 0.24
+        # ---- Epoch loop ----
+        for epoch in range(1, cfg.experiment.epochs + 1):
+            # Optional: after epoch 1, cap gate ceiling to avoid over-opening
+            # if getattr(model.cfg, "use_ascender", False) and epoch >= 2:
+            #     for li in (0, 1):
+            #         if li >= len(model.decoder.layers):
+            #             continue
+            #         b = getattr(model.decoder.layers[li], "biaser_self", None)
+            #         if b is not None and hasattr(b, "cfg"):
+            #             if not hasattr(b.cfg, "gate_ceiling") or b.cfg.gate_ceiling is None:
+            #                 b.cfg.gate_ceiling = 0.65
+            #             elif b.cfg.gate_ceiling > 0.65:
+            #                 b.cfg.gate_ceiling = 0.65
 
-            if getattr(model.cfg, "use_ascender", False) and epoch >= 2:
-                for li in (0, 1):
-                    b = getattr(model.decoder.layers[li], "biaser_self", None)
-                    if b is not None and hasattr(b, "cfg"):
-                        # YAML에 다른 값이 이미 있으면 그대로 두고, 없을 때만 살짝 내리기
-                        if not hasattr(b.cfg, "gate_ceiling") or b.cfg.gate_ceiling is None:
-                            b.cfg.gate_ceiling = 0.65
-                        else:
-                            # 이미 설정된 상한이 0.7 이상이면 0.65로 보수적으로 낮춤
-                            if b.cfg.gate_ceiling > 0.65:
-                                b.cfg.gate_ceiling = 0.65
+            print(f"\n🧭 Epoch {epoch}/{cfg.experiment.epochs} | seed={seed}")
+            # resync expected_* at epoch start (after τ snapshot)
+            if getattr(model.cfg, "use_ascender", False):
+                sync_expected_to_runtime(model)
 
-            print(f"\n🧭 Epoch {epoch}/{exp_cfg.epochs} | seed={seed}")
             avg_loss = run_epoch(
                 model, train_loader, optimizer, scheduler, criterion,
-                device, exp_cfg.clip_grad, epoch_idx=epoch, ASC_IDX=2
+                device, cfg.experiment.clip_grad, epoch_idx=epoch, ASC_IDX=2
             )
             print(f"✅ Epoch {epoch} done. AvgLoss={avg_loss:.4f}")
-
             all_losses.append(avg_loss)
-            log_result(csv_path, {
+
+            log_result("logs/results_summary.csv", {
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "mode": mode,
+                "mode": cfg.mode,
                 "use_ascender": model_cfg.use_ascender,
                 "bias_combo": bias_combo,
                 "seed": seed,
@@ -482,8 +573,8 @@ def main():
 
         print(f"🏁 Finished seed={seed}")
 
-    # Save metrics
-    metrics_dir = f"logs/{mode}_logs"
+    # Save aggregated metrics
+    metrics_dir = f"logs/{cfg.mode}_logs"
     os.makedirs(metrics_dir, exist_ok=True)
     torch.save({"losses": all_losses}, f"{metrics_dir}/metrics.pt")
     print(f"✅ Saved metrics.pt → {metrics_dir}/metrics.pt")
@@ -494,11 +585,10 @@ def main():
         first_layer = model.decoder.layers[0]
         if getattr(first_layer, "biaser_self", None) is not None:
             T = 20
-            h = torch.zeros((1, T, model.cfg.d_model), device=device, dtype=torch.float32)
+            h = torch.randn((1, T, model.cfg.d_model), device=device, dtype=torch.float32) * 0.01
             qh = first_layer.self_attn._shape(first_layer.self_attn.q_proj(h))
             kh = first_layer.self_attn._shape(first_layer.self_attn.k_proj(h))
             bias = first_layer.biaser_self(qh, kh, pre_q=h, pre_k=h)[0, 0].detach().cpu()
-
             os.makedirs("logs/heatmaps", exist_ok=True)
             plt.figure(figsize=(5, 4))
             im = plt.imshow(bias, cmap="coolwarm", interpolation="nearest")
@@ -506,9 +596,9 @@ def main():
             plt.title("Decoder[0] Self-Attn Bias Heatmap")
             plt.xlabel("Key Position"); plt.ylabel("Query Position")
             plt.tight_layout()
-            save_path = "logs/heatmaps/bias_final.png"
-            plt.savefig(save_path); plt.close()
-            print(f"[Saved] Final bias heatmap → {save_path}")
+            sp = "logs/heatmaps/bias_final.png"
+            plt.savefig(sp); plt.close()
+            print(f"[Saved] Final bias heatmap → {sp}")
             print(f"  Bias stats — mean={float(bias.mean()):.4f}, std={float(bias.std()):.4f}, "
                   f"min={float(bias.min()):.4f}, max={float(bias.max()):.4f}")
 
