@@ -1,0 +1,106 @@
+# ==========================================
+# ASCender VERY AGGRESSIVE Configuration
+# Goal: MAXIMUM measurable effect - will likely hurt performance but signal will be OBVIOUS
+# Use for: Understanding what ASCender CAN do (not optimal performance)
+# ==========================================
+
+dataset:
+  name: "wikitext-2-v1"
+  seq_len: 128
+  batch_size: 8
+  vocab_size: 30000
+  num_workers: 2
+  pin_memory: true
+
+mode: additive
+
+experiment:
+  name: ascender_very_aggressive
+  seeds: [42]
+  epochs: 3  # Shorter run for diagnostics
+  batch_size: 8
+  lr: 0.0005
+  lr_asc: 0.0015               # 3x higher ASC LR
+  warmup_steps: 100            # Shorter warmup
+  clip_grad: 2.0               # Much higher clip
+  smoothing: 0.0
+
+model:
+  src_vocab_size: 30000
+  tgt_vocab_size: 30000
+  d_model: 256
+  n_heads: 8
+  n_layers_enc: 3
+  n_layers_dec: 3
+  d_ff: 1024
+  dropout: 0.1
+  pad_id: 0
+
+  use_ascender: true
+  asc_bias_enc: false
+  asc_bias_dec_self: true
+  asc_bias_dec_cross: false
+
+  probe_every: 0
+
+  # ---- std_match_ratio override (controls bias magnitude in MHA) ----
+  std_match_ratio_override: 0.90  # Very aggressive: 90% of scores std
+
+  asc_cfg:
+    # ---- ALL components MAXED ----
+    use_alignment:  true
+    use_separation: false
+    use_cohesion:   true
+
+    # ---- VERY HIGH component weights ----
+    w_align: 0.35                # Nearly double moderate
+    w_sep:   0.15                # Strong separation
+    w_coh:   0.40                # Very strong cohesion
+
+    # ---- Positional kernels ----
+    sigma_sep: 2.0               # Wider separation zone
+    sigma_coh: 6.0               # Long-range cohesion
+
+    # ---- Alignment options ----
+    align_source: "qk"
+    temperature: 0.5             # VERY sharp alignment
+
+    # ---- WIDE safety clamps ----
+    clamp_min: -5.0
+    clamp_max: 5.0
+
+    # ---- Directionality & band-pass ----
+    past_only: true
+    band_min: 0
+    band_max: 128                # Full sequence range
+
+    # ---- Per-head heterogeneity ----
+    per_head_scale: true
+    per_head_gate:  true
+
+    # ---- HIGH initial values ----
+    global_scale_init: 1.5       # Much higher than safe
+    use_gate: true
+    gate_init: -0.5              # VERY open gate
+    gate_floor: 0.30
+    gate_ceiling: 0.80           # Nearly wide open
+
+    # ---- AUTO-CALIBRATION DISABLED ----
+    use_auto_calibrate: false    # Let it run completely free
+
+    # ---- LOOSE runtime safety caps ----
+    hard_max_ratio: 1.0          # Allow bias = scores magnitude
+    hard_target_ratio: 0.70
+    gamma_min: 0.20
+    gamma_cap: 8.0               # Very high cap
+
+    jitter_std: 1e-2             # High jitter
+
+    # ---- ALiBi mix ----
+    use_alibi_mix: false         # Pure structural bias
+    alpha_start: 1.0
+    alpha_end: 1.0
+    alpha_schedule: "none"
+    alpha_total_steps: 0
+
+    std_batch_mean: true

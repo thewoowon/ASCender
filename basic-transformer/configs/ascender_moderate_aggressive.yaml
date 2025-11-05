@@ -1,0 +1,111 @@
+# ==========================================
+# ASCender MODERATE AGGRESSIVE Configuration
+# Goal: CLEAR measurable effect without destroying learning
+# Expected: Loss might be 5-10% worse BUT bias effect is visible
+# ==========================================
+
+dataset:
+  name: "wikitext-2-v1"
+  seq_len: 128
+  batch_size: 8
+  vocab_size: 30000
+  num_workers: 2
+  pin_memory: true
+
+mode: additive
+
+experiment:
+  name: ascender_moderate_aggressive
+  seeds: [42]  # Single seed for faster iteration
+  epochs: 5
+  batch_size: 8
+  lr: 0.0005
+  lr_asc: 0.0008               # HIGHER ASC LR - let it learn faster
+  warmup_steps: 200
+  clip_grad: 1.2               # Higher clip allows bigger updates
+  smoothing: 0.0
+
+model:
+  src_vocab_size: 30000
+  tgt_vocab_size: 30000
+  d_model: 256
+  n_heads: 8
+  n_layers_enc: 3
+  n_layers_dec: 3
+  d_ff: 1024
+  dropout: 0.1
+  pad_id: 0
+
+  use_ascender: true
+  asc_bias_enc: false
+  asc_bias_dec_self: true
+  asc_bias_dec_cross: false
+
+  probe_every: 0
+
+  # ---- std_match_ratio override (controls bias magnitude in MHA) ----
+  std_match_ratio_override: 0.50  # Moderate-aggressive: 50% of scores std
+
+  asc_cfg:
+    # ---- ALL components enabled for maximum signal ----
+    use_alignment:  true         # ✅ Enable alignment
+    use_separation: true         # ✅ Enable separation (contrast)
+    use_cohesion:   true         # ✅ Enable cohesion
+
+    # ---- Moderate-high component weights ----
+    w_align: 0.15                # 5x higher than safe (was 0.03)
+    w_sep:   0.08                # Separation creates contrast
+    w_coh:   0.20                # Strong local preference
+
+    # ---- Positional kernels ----
+    sigma_sep: 1.5               # Slightly wider separation
+    sigma_coh: 4.0               # Medium-range cohesion
+
+    # ---- Alignment options ----
+    align_source: "qk"           # Use QK for stronger signal
+    temperature: 0.8             # LOWER temp = sharper alignment
+
+    # ---- Looser safety clamps ----
+    clamp_min: -3.0
+    clamp_max: 3.0
+
+    # ---- Directionality & band-pass ----
+    past_only: true
+    band_min: 0
+    band_max: 64                 # Wider range
+
+    # ---- Per-head heterogeneity ----
+    per_head_scale: true         # ✅ Enable per-head gamma
+    per_head_gate:  true         # ✅ Enable per-head gate
+
+    # ---- Higher initial values ----
+    global_scale_init: 0.8       # Much higher gamma
+    use_gate: true
+    gate_init: -1.5              # More open gate
+    gate_floor: 0.20
+    gate_ceiling: 0.60           # Higher ceiling
+
+    # ---- AUTO-CALIBRATION DISABLED ----
+    use_auto_calibrate: false    # 🔴 Let it run free!
+    target_ratio: 0.30
+    calibrate_warmup_steps: 0
+    calibrate_step_clamp_lo: 0.95
+    calibrate_step_clamp_hi: 1.05
+    ema_momentum: 0.95
+
+    # ---- Looser runtime safety caps ----
+    hard_max_ratio: 0.70         # Allow stronger bias
+    hard_target_ratio: 0.50
+    gamma_min: 0.20
+    gamma_cap: 4.0               # Higher cap
+
+    jitter_std: 5e-3             # More jitter for diversity
+
+    # ---- ALiBi mix for initialization stability ----
+    use_alibi_mix: true          # ✅ Use ALiBi scaffold
+    alpha_start: 0.7             # Start 70% structural, 30% ALiBi
+    alpha_end: 0.85              # End 85% structural, 15% ALiBi
+    alpha_schedule: "cosine"
+    alpha_total_steps: 1000
+
+    std_batch_mean: true

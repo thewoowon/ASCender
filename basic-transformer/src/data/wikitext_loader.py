@@ -47,7 +47,6 @@ def get_dataloader(cfg, split="train"):
     cfg: 전체 YAML 파싱된 Namespace or dict
     cfg.dataset.batch_size, seq_len 등 사용
     """
-    print("cfg:", cfg)
     dataset = WikiTextDataset(cfg)
     loader = DataLoader(
         dataset,

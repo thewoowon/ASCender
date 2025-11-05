@@ -1,0 +1,114 @@
+# ==========================================
+# ASCender SAFE Configuration
+# Conservative hyperparameters that won't overwhelm attention
+# ==========================================
+
+dataset:
+  name: "wikitext-2-v1"
+  seq_len: 128
+  batch_size: 8
+  vocab_size: 30000
+  num_workers: 2
+  pin_memory: true
+
+# Transformer Attention Mode
+mode: additive
+
+experiment:
+  name: ascender_safe
+  seeds: [42, 43, 44]
+  epochs: 10
+  batch_size: 8
+  lr: 0.0005                   # base model LR
+  lr_asc: 0.0002               # LOWER ASC LR - prevents runaway learning
+  warmup_steps: 200
+  clip_grad: 0.8
+  smoothing: 0.0
+
+model:
+  src_vocab_size: 30000
+  tgt_vocab_size: 30000
+  d_model: 256
+  n_heads: 8
+  n_layers_enc: 3
+  n_layers_dec: 3
+  d_ff: 1024
+  dropout: 0.1
+  pad_id: 0
+
+  # === ASCender Bias Attachments ===
+  use_ascender: true
+  asc_bias_enc: false            # encoder OFF (keeps training stable)
+  asc_bias_dec_self: true        # decoder self-attn ON (L0~L1 attached by code)
+  asc_bias_dec_cross: false      # cross-attn OFF (recommended)
+
+  # === Debug / Probes ===
+  probe_every: 0
+
+  # === ASCender Bias Config (SAFE PARAMETERS) ===
+  asc_cfg:
+    # ---- Components (Start with ONLY cohesion, add alignment later if needed) ----
+    use_alignment:  false        # 🔴 DISABLED - avoid double-counting q·k
+    use_separation: false        # 🔴 OFF for stability
+    use_cohesion:   true         # ✅ Gentle local bias only
+
+    # ---- Component weights (VERY CONSERVATIVE) ----
+    # These are pre-gamma weights. Keep them small!
+    w_align: 0.03                # Very small if you re-enable
+    w_sep:   0.00                # Disabled
+    w_coh:   5.08                # Gentle local preference only
+
+    # ---- Positional kernels ----
+    sigma_sep: 1.0
+    sigma_coh: 3.0               # Local neighborhood focus
+
+    # ---- Alignment options ----
+    align_source: "preproj"      # Use embeddings, not qk (if you re-enable)
+    temperature: 1.2             # Soften alignment similarity
+
+    # ---- Safety clamp before γ (TIGHTER) ----
+    clamp_min: -1.5              # Narrower range
+    clamp_max: 1.5
+
+    # ---- Directionality & band-pass ----
+    past_only: true
+    band_min: 0
+    band_max: 32                 # Shorter range - focus on recent context
+
+    # ---- Per-head heterogeneity (DISABLED for safety) ----
+    per_head_scale: false        # Use global gamma to avoid explosions
+    per_head_gate:  false        # Use global gate
+
+    # ---- Global scaling & gate (VERY CONSERVATIVE) ----
+    global_scale_init: 0.3       # Low initial gamma
+    use_gate: true
+    gate_init: -3.0              # Start mostly closed (sigmoid(-3) ≈ 0.05)
+    gate_floor: 0.10             # Minimum 10% influence
+    gate_ceiling: 0.35           # Maximum 35% influence (was 0.65!)
+
+    # ---- Auto-calibration (ENABLED with low target) ----
+    use_auto_calibrate: true     # Let it self-regulate
+    target_ratio: 0.12           # Target: bias std = 12% of scores std
+    calibrate_warmup_steps: 100  # Start calibrating after warmup
+    calibrate_step_clamp_lo: 0.95  # Gentle adjustments
+    calibrate_step_clamp_hi: 1.05
+    ema_momentum: 0.95           # Slow EMA tracking
+
+    # ---- Runtime safety caps ----
+    hard_max_ratio: 0.40         # Hard stop if bias exceeds 40% of scores std
+    hard_target_ratio: 0.25      # Scale down to 25% if limit hit
+    gamma_min: 0.10              # Allow very small gamma
+    gamma_cap: 2.5               # Tight gamma cap (was 6.0!)
+
+    # ---- Symmetry break ----
+    jitter_std: 1e-4             # Minimal jitter
+
+    # ---- ALiBi convex mix (DISABLED - keep it simple) ----
+    use_alibi_mix: false
+    alpha_start: 0.5
+    alpha_end: 0.5
+    alpha_schedule: "none"
+    alpha_total_steps: 0
+
+    # ---- Batch std aggregation ----
+    std_batch_mean: true

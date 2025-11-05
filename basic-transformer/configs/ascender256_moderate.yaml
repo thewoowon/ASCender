@@ -1,0 +1,119 @@
+# ==========================================
+# ASCender Experiment Configuration (MODERATE)
+# ==========================================
+# This is a moderated version of ascender256.yaml with reduced
+# parameter conflicts and more conservative aggressive settings.
+
+dataset:
+  name: "wikitext-2-v1"
+  seq_len: 256
+  batch_size: 4
+  vocab_size: 30000
+  num_workers: 2
+  pin_memory: true
+
+mode: additive
+
+experiment:
+  name: ascender_coh_align_moderate
+  seeds: [42]
+  epochs: 3
+  batch_size: 4
+  lr: 0.0005
+  lr_asc: 0.0008           # Slightly faster for ASCender params
+  warmup_steps: 400        # ← CHANGED: longer warmup for stability
+  clip_grad: 1.0           # ← CHANGED: less restrictive gradient clipping
+  smoothing: 0.00
+
+model:
+  src_vocab_size: 30000
+  tgt_vocab_size: 30000
+
+  d_model: 256
+  n_heads: 8
+  n_layers_enc: 3
+  n_layers_dec: 3
+  d_ff: 1024
+  dropout: 0.05            # ← CHANGED: minimal regularization to prevent overfitting
+
+  pad_id: 0
+
+  # === ASCender Bias Settings ===
+  use_ascender: true
+  asc_bias_enc: false
+  asc_bias_dec_self: true
+  asc_bias_dec_cross: false
+
+  # === Debug / Probes ===
+  probe_every: 50
+
+  asc_cfg:
+    # Plan: ALL THREE components for emergent structure formation
+    # Alignment → semantic clustering (like-minded tokens)
+    # Cohesion → local neighborhood attraction
+    # Separation → prevent over-clustering
+    use_alignment:  true
+    use_separation: true    # ← ENABLED: essential for structure
+    use_cohesion:   true
+
+    # weights (balanced to allow emergent patterns)
+    w_align: 3.0            # Semantic similarity attraction
+    w_sep:   1.5            # Repulsion to maintain spacing
+    w_coh:   4.0            # Local neighborhood cohesion
+
+    # Positional kernels (WIDER for linguistic neighborhoods)
+    sigma_sep: 2.0          # Repulsion range: 2-4 tokens
+    sigma_coh: 20.0         # ← WIDENED: cohesion up to 40 tokens
+
+    # Alignment options
+    align_source: "qk"
+    temperature: 1.0
+
+    # Stabilize pre-γ (WIDENED to preserve signal)
+    clamp_min: -10.0        # ← INCREASED: match weight magnitudes
+    clamp_max:  10.0        # ← INCREASED: preserve built bias
+
+    # Centering control (DISABLED to preserve global structure)
+    enable_centering: false # ← CRITICAL: allows emergent global patterns
+
+    # Directionality & band-pass
+    past_only: true
+    band_min: 0
+    band_max: 96            # ← WIDENED: allow longer-range interactions
+
+    # per-head
+    per_head_scale: true
+    per_head_gate:  false
+
+    # scaling (γ) & gate (σ)
+    global_scale_init: 1.0
+    use_gate: true
+    gate_init: 0.0         # Start at 0.5 (balanced)
+    gate_floor: 0.15       # ← LOWERED: allow stronger suppression if needed
+    gate_ceiling: 0.85     # ← INCREASED: allow stronger influence
+
+    # === ALiBi convex mix (DISABLED to preserve ASCender structure) ===
+    use_alibi_mix: false   # ← DISABLED: ALiBi interferes with emergent patterns
+    alpha_start: 1.0       # Pure ASCender from start
+    alpha_end:   1.0
+    alpha_schedule: "none"
+    alpha_total_steps: 0
+
+    # === Auto-calibration (SOFTENED to allow natural learning) ===
+    use_auto_calibrate: true
+    target_ratio: 0.40     # ← INCREASED: allow stronger bias influence
+    calibrate_step_clamp_lo: 0.95  # ← TIGHTER: gentler adjustments
+    calibrate_step_clamp_hi: 1.05  # ← TIGHTER: gentler adjustments
+    ema_momentum: 0.95     # ← HIGHER: slower adaptation
+
+    # === Runtime safety / caps ===
+    hard_max_ratio: 0.85
+    hard_target_ratio: 0.55
+    gamma_min: 0.90
+    gamma_cap: 6.0
+
+    # Symmetry break
+    jitter_std: 0.001
+
+    # batch std aggregation for bias scaling
+    std_batch_mean: true

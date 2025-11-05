@@ -1,0 +1,151 @@
+# ==========================================
+# ASCender Experiment Configuration (EMERGENT)
+# ==========================================
+# Based on the principle: "Local interactions → emergent structures"
+# ALL THREE components enabled for true emergent behavior
+
+dataset:
+  name: "wikitext-2-v1"
+  seq_len: 256
+  batch_size: 4
+  vocab_size: 30000
+  num_workers: 2
+  pin_memory: true
+
+mode: additive
+
+experiment:
+  name: ascender_emergent_full
+  seeds: [42]
+  epochs: 3
+  batch_size: 4
+  lr: 0.0005
+  lr_asc: 0.001           # Faster learning for bias components
+  warmup_steps: 500       # Longer warmup for stability
+  clip_grad: 1.2          # Less restrictive for emergent learning
+  smoothing: 0.00
+
+model:
+  src_vocab_size: 30000
+  tgt_vocab_size: 30000
+
+  d_model: 256
+  n_heads: 8
+  n_layers_enc: 3
+  n_layers_dec: 3
+  d_ff: 1024
+  dropout: 0.05           # Minimal regularization
+
+  pad_id: 0
+
+  # === ASCender Bias Settings ===
+  use_ascender: true
+  asc_bias_enc: false
+  asc_bias_dec_self: true
+  asc_bias_dec_cross: false
+
+  # === Debug / Probes ===
+  probe_every: 100
+
+  asc_cfg:
+    # ═══════════════════════════════════════════════════════════
+    # ALL THREE BOIDS COMPONENTS FOR EMERGENT STRUCTURE
+    # ═══════════════════════════════════════════════════════════
+    # Alignment → Semantic attraction (content-based clustering)
+    # Cohesion  → Neighborhood attraction (local grouping)
+    # Separation → Repulsion (prevent over-clustering, create boundaries)
+
+    use_alignment:  true
+    use_separation: true    # ✅ ESSENTIAL: Without this, no structure emerges!
+    use_cohesion:   true
+
+    # ═══════════════════════════════════════════════════════════
+    # COMPONENT WEIGHTS (balanced for emergent patterns)
+    # ═══════════════════════════════════════════════════════════
+    w_align: 3.0            # Semantic similarity drives clustering
+    w_sep:   1.5            # Repulsion creates spacing (half of cohesion)
+    w_coh:   4.5            # Cohesion creates local neighborhoods
+
+    # ═══════════════════════════════════════════════════════════
+    # SPATIAL KERNELS (WIDENED for linguistic neighborhoods)
+    # ═══════════════════════════════════════════════════════════
+    sigma_sep: 2.0          # Repulsion effective up to ~4 tokens
+    sigma_coh: 30.0         # Cohesion effective up to ~60 tokens
+                            # (was 3.0 → only 6 tokens, TOO NARROW!)
+
+    # ═══════════════════════════════════════════════════════════
+    # ALIGNMENT OPTIONS
+    # ═══════════════════════════════════════════════════════════
+    align_source: "qk"      # Use projected Q/K for content similarity
+    temperature: 1.0
+
+    # ═══════════════════════════════════════════════════════════
+    # CLAMP LIMITS (WIDENED to preserve built signal)
+    # ═══════════════════════════════════════════════════════════
+    clamp_min: -12.0        # ✅ INCREASED: was -2.0 (destroyed 80% of signal!)
+    clamp_max:  12.0        # ✅ INCREASED: now preserves full weight range
+
+    # ═══════════════════════════════════════════════════════════
+    # CENTERING CONTROL (DISABLED to preserve global structure)
+    # ═══════════════════════════════════════════════════════════
+    enable_centering: false # ✅ CRITICAL: Centering destroys emergent global patterns!
+
+    # ═══════════════════════════════════════════════════════════
+    # DIRECTIONALITY & BAND-PASS
+    # ═══════════════════════════════════════════════════════════
+    past_only: true         # Causal masking (decoder requirement)
+    band_min: 0
+    band_max: 128           # ✅ WIDENED: allow long-range interactions
+
+    # ═══════════════════════════════════════════════════════════
+    # PER-HEAD CONTROL
+    # ═══════════════════════════════════════════════════════════
+    per_head_scale: true    # Each head learns its own γ
+    per_head_gate:  false   # Shared gate for simplicity
+
+    # ═══════════════════════════════════════════════════════════
+    # SCALING (γ) & GATE (σ)
+    # ═══════════════════════════════════════════════════════════
+    global_scale_init: 1.0
+    use_gate: true
+    gate_init: 0.0          # Start at sigmoid(0) = 0.5 (balanced)
+    gate_floor: 0.10        # ✅ LOWERED: allow strong suppression if needed
+    gate_ceiling: 0.90      # ✅ RAISED: allow strong influence
+
+    # ═══════════════════════════════════════════════════════════
+    # ALiBi MIXING (DISABLED - interferes with emergent structure)
+    # ═══════════════════════════════════════════════════════════
+    use_alibi_mix: false    # ✅ DISABLED: ALiBi linear bias conflicts with
+                            #              Gaussian spatial structure
+    alpha_start: 1.0
+    alpha_end:   1.0
+    alpha_schedule: "none"
+    alpha_total_steps: 0
+
+    # ═══════════════════════════════════════════════════════════
+    # AUTO-CALIBRATION (SOFTENED to preserve natural gradients)
+    # ═══════════════════════════════════════════════════════════
+    use_auto_calibrate: true
+    target_ratio: 0.50      # ✅ INCREASED: allow bias to have real influence
+                            #              (was 0.30 = "correction", not "driver")
+    calibrate_step_clamp_lo: 0.97  # ✅ GENTLER: reduce interference (was 0.90)
+    calibrate_step_clamp_hi: 1.03  # ✅ GENTLER: reduce interference (was 1.12)
+    ema_momentum: 0.96      # ✅ SLOWER: let patterns stabilize naturally
+
+    # ═══════════════════════════════════════════════════════════
+    # RUNTIME SAFETY / CAPS
+    # ═══════════════════════════════════════════════════════════
+    hard_max_ratio: 1.0     # ✅ RAISED: allow bias equal to attention scores
+    hard_target_ratio: 0.70 # ✅ RAISED: target when rescaling
+    gamma_min: 0.50
+    gamma_cap: 8.0          # ✅ RAISED: allow stronger scaling
+
+    # ═══════════════════════════════════════════════════════════
+    # SYMMETRY BREAK
+    # ═══════════════════════════════════════════════════════════
+    jitter_std: 0.001       # Small per-head initialization noise
+
+    # ═══════════════════════════════════════════════════════════
+    # BATCH STD AGGREGATION
+    # ═══════════════════════════════════════════════════════════
+    std_batch_mean: true    # Average std across batch for stability

@@ -18,8 +18,8 @@ experiment:
   epochs: 3
   batch_size: 4
   lr: 0.0005
-  lr_asc: 0.0005
-  warmup_steps: 200
+  lr_asc: 0.00025
+  warmup_steps: 800
   clip_grad: 0.8
   smoothing: 0.00
 
@@ -43,7 +43,9 @@ model:
 
   # === Debug / Probes ===
   # 0이면 스냅샷/프로브 비활성(권장). 디버깅 때만 200~500으로.
-  probe_every: 50
+  probe_every: 0
+
+  std_match_ratio_override: 0.30
 
   asc_cfg:
     # Plan: cohesion + light alignment (Δp↑, 과개입 방지)
@@ -52,7 +54,7 @@ model:
     use_cohesion:   true
 
     # weights (Δp 상향 유지)
-    w_align: 10.0
+    w_align: 5.0
     w_sep:   0.00
     w_coh:   10.0
 
@@ -78,18 +80,18 @@ model:
     per_head_gate:  false
 
     # scaling (γ) & gate (σ)
-    global_scale_init: 1.0
+    global_scale_init: 0.6
     use_gate: true
-    gate_init: -0.6          # 초깃값 ≈ 0.35 부근
-    gate_floor: 0.35
-    gate_ceiling: 0.65       # 단일 소스 (train.py에서 재캡 금지)
+    gate_init: -1.2          # 초깃값 ≈ 0.35 부근
+    gate_floor: 0.20
+    gate_ceiling: 0.70       # 단일 소스 (train.py에서 재캡 금지)
 
     # === ALiBi convex mix (ASC ⟷ ALiBi) ===
     use_alibi_mix: true
-    alpha_start: 0.20         # 초반 ALiBi 비중↑(1-α)
+    alpha_start: 0.30         # 초반 ALiBi 비중↑(1-α)
     alpha_end:   0.70         # 중반 이후 ASC 비중↑
     alpha_schedule: "cosine"
-    alpha_total_steps: 1500    # 로더 총 step에 맞춰 필요시만 조정
+    alpha_total_steps: 1000    # 로더 총 step에 맞춰 필요시만 조정
 
     # === Auto-calibration (Δp 타깃팅) ===
     use_auto_calibrate: true
@@ -101,9 +103,9 @@ model:
     # === Runtime safety / caps ===
     hard_max_ratio: 0.85       # 절대 상한(폭주 방지)
     hard_target_ratio: 0.55    # 타깃 상한
-    gamma_min: 0.90
+    gamma_min: 0.30
     # gamma_max: 1.6             # 하나만 둠(중복 cap 제거)
-    gamma_cap: 6.0
+    gamma_cap: 4.0
 
     # Symmetry break
     jitter_std: 0.001

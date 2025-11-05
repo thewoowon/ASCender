@@ -9,7 +9,7 @@ import argparse
 import importlib
 from datetime import datetime
 from types import SimpleNamespace
-
+import numpy as np
 import torch
 
 # ---- Optional helpers (graceful fallback if utils are absent) ----
@@ -135,6 +135,79 @@ def collect_attn_metrics(model) -> dict:
         "kl_mean": float(sum(kls) / len(kls)),
     }
 
+@torch.no_grad()
+def _row_entropy(P: torch.Tensor) -> torch.Tensor:
+    # P: (Tq, Tk)
+    P = P.clamp_min(1e-12)
+    return (-P * torch.log(P)).sum(dim=-1)
+
+@torch.no_grad()
+def _plot_attn_map(A_2d: torch.Tensor, epoch: int, layer: int, head: int, tag: str):
+    """
+    A_2d: (Tq, Tk) attention probability
+    """
+    H = _row_entropy(A_2d).mean().item()
+    os.makedirs("logs/attn", exist_ok=True)
+
+    plt.figure(figsize=(10, 8))
+    im = plt.imshow(A_2d.cpu().numpy(), aspect='auto', cmap='viridis', vmin=0, vmax=1, interpolation='nearest')
+    plt.title(f"{tag} | L{layer} H{head} | Epoch {epoch} | H={H:.3f}", fontsize=14, fontweight='bold')
+    plt.xlabel("Key index (j)", fontsize=12)
+    plt.ylabel("Query index (i)", fontsize=12)
+    cbar = plt.colorbar(im, label='Attention Probability')
+    cbar.ax.tick_params(labelsize=10)
+    plt.tight_layout()
+    sp = f"logs/attn/{tag}_L{layer}_H{head}_E{epoch:02d}.png"
+    plt.savefig(sp, dpi=300); plt.close()
+    print(f"[Saved] attn heatmap → {sp}")
+
+@torch.no_grad()
+def save_attn_heatmaps(model, batch, device, epoch_idx: int, layers=(0,1), heads=(0,1), tag="train"):
+    """
+    1) 배치를 한 번 forward 해 attn snapshot을 최신화
+    2) 각 레이어/헤드의 post-softmax 확률(attn_post_masked)을 읽어 히트맵 저장
+    """
+    if not hasattr(model, "decoder") or batch is None:
+        return
+
+    # 작은 배치만 사용 (메모리/속도)
+    src, tgt_inp, _ = batch
+    src, tgt_inp = src.to(device), tgt_inp.to(device)
+
+    # forward 한 번으로 self_attn의 스냅샷(attn_post_masked 등) 갱신
+    _ = model(src, tgt_inp)
+
+    for li in layers:
+        if li >= len(model.decoder.layers):
+            continue
+        mha = model.decoder.layers[li].self_attn
+
+        # 선호 순서: attn_post_masked -> last_attn -> attn_probs
+        P = getattr(mha, "attn_post_masked", None)
+        if P is None:
+            P = getattr(mha, "last_attn", None)
+        if P is None:
+            P = getattr(mha, "attn_probs", None)
+        if P is None:
+            print(f"[Warn] No attn snapshot on L{li}. Skipping.")
+            continue
+
+        # 텐서 형태: (B, n_heads, Tq, Tk)
+        if P.dim() != 4:
+            print(f"[Warn] Unexpected attn shape on L{li}: {tuple(P.shape)}")
+            continue
+
+        # 첫 샘플만 시각화
+        P = P[0]  # (n_heads, Tq, Tk)
+        for h in heads:
+            if h >= P.size(0):
+                continue
+            A_2d = P[h].float()
+            # 혹시 확률이 아니면 softmax로 보정
+            if not torch.all((A_2d >= 0) & (A_2d <= 1)) or not torch.allclose(A_2d.sum(-1), torch.ones_like(A_2d.sum(-1)), atol=1e-3):
+                A_2d = torch.softmax(A_2d, dim=-1)
+            _plot_attn_map(A_2d, epoch=epoch_idx, layer=li, head=h, tag=tag)
+
 
 # ============================================================
 # DRIFT suppressor: sync expected <- current (once per epoch)
@@ -159,7 +232,7 @@ def sync_expected_to_runtime(model):
             ("expected_tau", getattr(a, "attn_temperature", None)),
             ("expected_topk", getattr(a, "sparsify_k_frac", None)),
             ("expected_r", getattr(a, "std_match_ratio", None)),
-            ("expected_v_eps", getattr(a, "value_eps", None) if hasattr(a, "value_eps") else getattr(a, "v_gain_epsilon", None)),
+            ("expected_v_eps", getattr(a, "v_gain_epsilon", None)),
         ]
         for name, cur in mappings:
             if cur is not None and hasattr(b, name):
@@ -174,6 +247,73 @@ def sync_expected_to_runtime(model):
 # ============================================================
 
 @torch.no_grad()
+def log_alpha_values(model, epoch, seed):
+    """
+    Log learned alpha mixing weights from Residual Bias Path.
+    Shows how much each head uses spatial bias vs. learned attention.
+    """
+    alpha_data = {"epoch": epoch, "seed": seed, "encoder": [], "decoder": []}
+
+    # Check if residual path is enabled
+    has_residual = getattr(model.cfg, "enable_residual_path", False)
+    if not has_residual:
+        return  # Skip if not using residual path
+
+    # Encoder
+    for i, layer in enumerate(model.encoder.layers):
+        if hasattr(layer.self_attn, "alpha_logit"):
+            alpha = torch.sigmoid(layer.self_attn.alpha_logit.detach()).cpu()
+            has_bias = layer.self_attn.biaser is not None
+            alpha_data["encoder"].append({
+                "layer": i,
+                "alpha": alpha.numpy().tolist(),
+                "mean": float(alpha.mean()),
+                "has_bias": has_bias
+            })
+
+    # Decoder
+    for i, layer in enumerate(model.decoder.layers):
+        if hasattr(layer.self_attn, "alpha_logit"):
+            alpha = torch.sigmoid(layer.self_attn.alpha_logit.detach()).cpu()
+            has_bias = layer.self_attn.biaser is not None
+            alpha_data["decoder"].append({
+                "layer": i,
+                "type": "self",
+                "alpha": alpha.numpy().tolist(),
+                "mean": float(alpha.mean()),
+                "has_bias": has_bias
+            })
+
+    # Save to JSON
+    os.makedirs("logs/alpha", exist_ok=True)
+    import json
+    alpha_path = f"logs/alpha/alpha_epoch{epoch:02d}_seed{seed}.json"
+    with open(alpha_path, "w") as f:
+        json.dump(alpha_data, f, indent=2)
+
+    # Print summary
+    all_means = []
+    for enc in alpha_data["encoder"]:
+        if enc["has_bias"]:
+            all_means.append(enc["mean"])
+    for dec in alpha_data["decoder"]:
+        if dec["has_bias"]:
+            all_means.append(dec["mean"])
+
+    if all_means:
+        import numpy as np
+        mean_alpha = np.mean(all_means)
+        print(f"[Alpha] Epoch {epoch} | Mean α across all heads: {mean_alpha:.4f}")
+        if mean_alpha > 0.9:
+            print(f"        ⚠️  Model ignoring spatial bias (α > 0.9)")
+        elif mean_alpha > 0.7:
+            print(f"        📊 Weak spatial bias influence (α > 0.7)")
+        elif mean_alpha > 0.3:
+            print(f"        ⚖️  Balanced mixing (0.3 < α < 0.7)")
+        else:
+            print(f"        🎯 Strong spatial bias influence (α < 0.3)")
+
+
 def quick_ab_check(model, batch, device):
     was_training = model.training
     model.eval()
@@ -239,6 +379,7 @@ def run_epoch(model, data_loader, optimizer, scheduler, criterion, device, clip_
     model.train()
     total_loss, steps = 0.0, 0
     LOG_EVERY = 100
+    last_batch_for_vis = None
 
     if not hasattr(model, "_global_step"):
         model._global_step = 0
@@ -247,15 +388,17 @@ def run_epoch(model, data_loader, optimizer, scheduler, criterion, device, clip_
 
     # epoch start: apply τ-snapshot and sync DRIFT expectations
     if getattr(model.cfg, "use_ascender", False):
-        tau0 = cosine_tau(model._global_step, model._total_steps_all, 1.0, 1.10)
-        apply_tau_to_asc_heads(model, tau0)
+        # DISABLED: tau schedule can interfere with learning
+        # Keep tau at 1.0 for stable training
+        # tau0 = cosine_tau(model._global_step, model._total_steps_all, 1.0, 1.10)
+        # apply_tau_to_asc_heads(model, tau0)
         sync_expected_to_runtime(model)
 
     for step, batch in enumerate(data_loader, 1):
-        # τ schedule per step (aggressive but monotone)
-        if getattr(model.cfg, "use_ascender", False):
-            tau = cosine_tau(model._global_step, model._total_steps_all, 1.00, 1.10)
-            apply_tau_to_asc_heads(model, tau)
+        # τ schedule DISABLED - keep constant at 1.0
+        # if getattr(model.cfg, "use_ascender", False):
+        #     tau = cosine_tau(model._global_step, model._total_steps_all, 1.00, 1.10)
+        #     apply_tau_to_asc_heads(model, tau)
 
         # 1-time wire print for quick sanity
         if step == 1 and getattr(model.cfg, "use_ascender", False):
@@ -268,6 +411,8 @@ def run_epoch(model, data_loader, optimizer, scheduler, criterion, device, clip_
 
         src, tgt_inp, tgt_out = (t.to(device) for t in batch)
         optimizer.zero_grad(set_to_none=True)
+
+        last_batch_for_vis = (src[:1], tgt_inp[:1], tgt_out[:1])
 
         logits = model(src, tgt_inp)
         if torch.isnan(logits).any():
@@ -308,85 +453,159 @@ def run_epoch(model, data_loader, optimizer, scheduler, criterion, device, clip_
             print(f"Step {step:03d} | Loss {float(loss):.4f} | Δp={metrics.get('delta_p_mean', 0.0):.4f} "
                   f"KL={metrics.get('kl_mean', 0.0):.4f}")
             # mini AB diagnostic
-            quick_ab_check(model, (src, tgt_inp, tgt_out), device)
+            # quick_ab_check(model, (src, tgt_inp, tgt_out), device)
 
             # Head-wise 상태
-            for li in [0, 1]:
-                biaser = getattr(model.decoder.layers[li], "biaser_self", None)
-                if biaser is None or not hasattr(biaser, "gamma_log"):
-                    continue
-                g_h = torch.exp(biaser.gamma_log.detach()).clamp(max=float(biaser.cfg.gamma_cap))
-                gt = None
-                if getattr(biaser, "gate_param", None) is not None:
-                    gt = torch.sigmoid(biaser.gate_param.detach())
-                    gt = biaser.cfg.gate_floor + (1.0 - biaser.cfg.gate_floor) * gt
-                    gt = torch.minimum(gt, torch.as_tensor(float(biaser.cfg.gate_ceiling), device=gt.device))
-                def mm(x): return float(x.min()), float(x.median()), float(x.max())
-                if gt is not None:
-                    a, bmd, c = mm(gt); d, e, f = mm(g_h)
-                    print(f"[ASC head][L{li}] gate(min/med/max)={a:.2f}/{bmd:.2f}/{c:.2f} | "
-                          f"γ(min/med/max)={d:.2f}/{e:.2f}/{f:.2f}")
+            # for li in [0, 1]:
+            #     biaser = getattr(model.decoder.layers[li], "biaser_self", None)
+            #     if biaser is None or not hasattr(biaser, "gamma_log"):
+            #         continue
+            #     g_h = torch.exp(biaser.gamma_log.detach()).clamp(max=float(biaser.cfg.gamma_cap))
+            #     gt = None
+            #     if getattr(biaser, "gate_param", None) is not None:
+            #         gt = torch.sigmoid(biaser.gate_param.detach())
+            #         gt = biaser.cfg.gate_floor + (1.0 - biaser.cfg.gate_floor) * gt
+            #         gt = torch.minimum(gt, torch.as_tensor(float(biaser.cfg.gate_ceiling), device=gt.device))
+            #     def mm(x): return float(x.min()), float(x.median()), float(x.max())
+            #     if gt is not None:
+            #         a, bmd, c = mm(gt); d, e, f = mm(g_h)
+            #         print(f"[ASC head][L{li}] gate(min/med/max)={a:.2f}/{bmd:.2f}/{c:.2f} | "
+            #               f"γ(min/med/max)={d:.2f}/{e:.2f}/{f:.2f}")
 
-            if getattr(model.cfg, "use_ascender", False):
-                b0 = getattr(model.decoder.layers[0], "biaser_self", None)
-                if b0 is not None:
-                    try:
-                        if getattr(b0.cfg, "per_head_gate", False) and getattr(b0, "gate_param", None) is not None:
-                            g = torch.sigmoid(b0.gate_param.detach()).cpu()
-                            gmn, gmd, gmx = g.min().item(), g.median().item(), g.max().item()
-                        else:
-                            gmn = gmd = gmx = float(getattr(b0, "gate_effective", 0.0))
-                        if getattr(b0.cfg, "per_head_scale", False) and getattr(b0, "gamma_log", None) is not None:
-                            gam = torch.exp(b0.gamma_log.detach()).clamp(max=b0.cfg.gamma_cap).cpu()
-                            amn, amd, amx = gam.min().item(), gam.median().item(), gam.max().item()
-                        else:
-                            ge = float(getattr(b0, "gamma_effective", 0.0))
-                            amn = amd = amx = ge
-                        print(f"[ASC head] gate(min/med/max)={gmn:.2f}/{gmd:.2f}/{gmx:.2f} | "
-                              f"γ(min/med/max)={amn:.2f}/{amd:.2f}/{amx:.2f}")
-                    except Exception as e:
-                        print(f"[ASC head] log failed: {e}")
-                if b0 is not None and hasattr(b0, "ema_ratio"):
-                    try:
-                        gamma_eff = getattr(b0, "gamma_effective", None)
-                        if gamma_eff is None and hasattr(b0, "gamma"):
-                            gamma_eff = float(b0.gamma.mean().item())
-                    except Exception:
-                        gamma_eff = None
-                    try:
-                        if hasattr(b0, "gate_effective"):
-                            gate_eff = b0.gate_effective
-                        elif hasattr(b0, "gate_param") and b0.gate_param is not None:
-                            gate_eff = float(torch.sigmoid(b0.gate_param).mean().item())
-                        else:
-                            gate_eff = None
-                    except Exception:
-                        gate_eff = None
-                    print(f"[ASC dbg] ratio(ema)={float(b0.ema_ratio):.3f} | "
-                          f"γ={('None' if gamma_eff is None else f'{gamma_eff:.3f}')} | "
-                          f"gate={('None' if gate_eff is None else f'{gate_eff:.3f}')}")
+            # if getattr(model.cfg, "use_ascender", False):
+            #     b0 = getattr(model.decoder.layers[0], "biaser_self", None)
+            #     if b0 is not None:
+            #         try:
+            #             if getattr(b0.cfg, "per_head_gate", False) and getattr(b0, "gate_param", None) is not None:
+            #                 g = torch.sigmoid(b0.gate_param.detach()).cpu()
+            #                 gmn, gmd, gmx = g.min().item(), g.median().item(), g.max().item()
+            #             else:
+            #                 gmn = gmd = gmx = float(getattr(b0, "gate_effective", 0.0))
+            #             if getattr(b0.cfg, "per_head_scale", False) and getattr(b0, "gamma_log", None) is not None:
+            #                 gam = torch.exp(b0.gamma_log.detach()).clamp(max=b0.cfg.gamma_cap).cpu()
+            #                 amn, amd, amx = gam.min().item(), gam.median().item(), gam.max().item()
+            #             else:
+            #                 ge = float(getattr(b0, "gamma_effective", 0.0))
+            #                 amn = amd = amx = ge
+            #             print(f"[ASC head] gate(min/med/max)={gmn:.2f}/{gmd:.2f}/{gmx:.2f} | "
+            #                   f"γ(min/med/max)={amn:.2f}/{amd:.2f}/{amx:.2f}")
+            #         except Exception as e:
+            #             print(f"[ASC head] log failed: {e}")
+            #     if b0 is not None and hasattr(b0, "ema_ratio"):
+            #         try:
+            #             gamma_eff = getattr(b0, "gamma_effective", None)
+            #             if gamma_eff is None and hasattr(b0, "gamma"):
+            #                 gamma_eff = float(b0.gamma.mean().item())
+            #         except Exception:
+            #             gamma_eff = None
+            #         try:
+            #             if hasattr(b0, "gate_effective"):
+            #                 gate_eff = b0.gate_effective
+            #             elif hasattr(b0, "gate_param") and b0.gate_param is not None:
+            #                 gate_eff = float(torch.sigmoid(b0.gate_param).mean().item())
+            #             else:
+            #                 gate_eff = None
+            #         except Exception:
+            #             gate_eff = None
+            #         print(f"[ASC dbg] ratio(ema)={float(b0.ema_ratio):.3f} | "
+            #               f"γ={('None' if gamma_eff is None else f'{gamma_eff:.3f}')} | "
+            #               f"gate={('None' if gate_eff is None else f'{gate_eff:.3f}')}")
 
     avg_loss = total_loss / max(steps, 1)
 
+    # === NEW: epoch-end attention heatmaps for L0/L1, heads 0/1 ===
+    if getattr(model.cfg, "use_ascender", False) and (epoch_idx is not None) and (last_batch_for_vis is not None):
+        try:
+            model.eval()
+            save_attn_heatmaps(
+                model,
+                last_batch_for_vis,
+                device,
+                epoch_idx=epoch_idx,
+                layers=(0,1),
+                heads=(0,1),
+                tag="train"
+            )
+        except Exception as e:
+            print(f"[Warning] attn heatmap save failed: {e}")
+    # === /NEW ===
+
     # Save bias heatmap for L0 at epoch end (if ASC enabled)
+    # NOTE: Visualize ENCODER bias (decoder bias may be disabled in config)
     if getattr(model.cfg, "use_ascender", False) and (epoch_idx is not None):
         try:
             os.makedirs("logs/heatmaps", exist_ok=True)
-            first_layer = model.decoder.layers[0]
-            if getattr(first_layer, "biaser_self", None) is not None:
+            # Try encoder first, fallback to decoder if encoder has no bias
+            first_layer = model.encoder.layers[0]
+            biaser = getattr(first_layer.self_attn, "biaser", None)
+            if biaser is None:
+                first_layer = model.decoder.layers[0]
+                biaser = getattr(first_layer, "biaser_self", None)
+
+            if biaser is not None:
                 T = 20
                 h = torch.randn((1, T, model.cfg.d_model), device=device, dtype=torch.float32) * 0.01
                 qh = first_layer.self_attn._shape(first_layer.self_attn.q_proj(h))
                 kh = first_layer.self_attn._shape(first_layer.self_attn.k_proj(h))
-                bias = first_layer.biaser_self(qh, kh, pre_q=h, pre_k=h)[0, 0].detach().cpu()
-                plt.figure(figsize=(5, 4))
-                im = plt.imshow(bias, cmap="coolwarm", interpolation="nearest")
-                plt.colorbar(im, label="Bias Value")
-                plt.title(f"Decoder[0] Self-Attn Bias (Epoch {epoch_idx})")
-                plt.xlabel("Key"); plt.ylabel("Query"); plt.tight_layout()
+                # Call biaser (handle different signatures)
+                try:
+                    bias_full = biaser(qh, kh, pre_q=h, pre_k=h)
+                except:
+                    bias_full = biaser(qh, kh)
+
+                # Extract first head from first batch
+                if bias_full.dim() == 4:  # (B, H, T, T)
+                    bias = bias_full[0, 0].detach().cpu()
+                else:  # (B, T, T) or (T, T)
+                    bias = bias_full[0].detach().cpu() if bias_full.dim() == 3 else bias_full.detach().cpu()
+
+                # 통계 기반 동적 범위 (mean ± 3σ로 대비 극대화)
+                bias_np = bias.numpy()
+                bias_mean = bias_np.mean()
+                bias_std = bias_np.std()
+
+                # 표준화 후 시각화 (z-score normalization으로 패턴 강조)
+                if bias_std > 1e-6:
+                    bias_normalized = (bias_np - bias_mean) / bias_std
+                    vmin, vmax = -3, 3  # ±3σ 범위로 고정
+                else:
+                    bias_normalized = bias_np
+                    vmin, vmax = bias_np.min(), bias_np.max()
+
+                fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+
+                # Determine layer type for title
+                layer_name = "Encoder L0" if hasattr(model.encoder.layers[0].self_attn, 'biaser') and model.encoder.layers[0].self_attn.biaser else "Decoder L0"
+
+                # 왼쪽: 정규화된 전체 히트맵
+                im1 = axes[0].imshow(bias_normalized, cmap="RdBu_r", interpolation="nearest", vmin=vmin, vmax=vmax, aspect='auto')
+                cbar1 = plt.colorbar(im1, ax=axes[0], label="Z-score (σ)")
+                cbar1.ax.tick_params(labelsize=10)
+                axes[0].set_title(f"{layer_name} Bias (Normalized) - Epoch {epoch_idx}", fontsize=12, fontweight='bold')
+                axes[0].set_xlabel("Key Position", fontsize=11)
+                axes[0].set_ylabel("Query Position", fontsize=11)
+
+                # 오른쪽: 원본 값 (mean ± 3σ 범위로 클램핑해서 대비 강화)
+                clamp_min = bias_mean - 3 * bias_std
+                clamp_max = bias_mean + 3 * bias_std
+                bias_clamped = np.clip(bias_np, clamp_min, clamp_max)
+
+                im2 = axes[1].imshow(bias_clamped, cmap="coolwarm", interpolation="nearest",
+                                     vmin=clamp_min, vmax=clamp_max, aspect='auto')
+                cbar2 = plt.colorbar(im2, ax=axes[1], label="Bias Value (clamped)")
+                cbar2.ax.tick_params(labelsize=10)
+                axes[1].set_title(f"{layer_name} Raw Values (±3σ) - Epoch {epoch_idx}", fontsize=12, fontweight='bold')
+                axes[1].set_xlabel("Key Position", fontsize=11)
+                axes[1].set_ylabel("Query Position", fontsize=11)
+
+                # 통계 정보 추가
+                stats_text = f"μ={bias_mean:.3f}, σ={bias_std:.3f}, min={bias_np.min():.3f}, max={bias_np.max():.3f}"
+                fig.text(0.5, 0.02, stats_text, ha='center', fontsize=10, style='italic')
+
+                plt.tight_layout(rect=[0, 0.03, 1, 1])
                 sp = f"logs/heatmaps/bias_epoch_{epoch_idx:02d}.png"
-                plt.savefig(sp); plt.close()
-                print(f"[Saved] Bias heatmap → {sp}")
+                plt.savefig(sp, dpi=300); plt.close()
+                print(f"[Saved] Bias heatmap → {sp} | {stats_text}")
         except Exception as e:
             print(f"[Warning] Heatmap save failed: {e}")
 
@@ -571,7 +790,111 @@ def main():
                 "avg_loss": avg_loss,
             })
 
+            # Log alpha values if using residual path
+            if getattr(model_cfg, "enable_residual_path", False):
+                log_alpha_values(model, epoch, seed)
+
         print(f"🏁 Finished seed={seed}")
+
+    # ============================================================
+    # Save model checkpoint
+    # ============================================================
+    checkpoint_dir = "logs/checkpoints"
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    checkpoint_path = f"{checkpoint_dir}/model_{cfg.experiment.name}_seed{seed}_{timestamp}.pt"
+
+    torch.save({
+        "model_state_dict": model.state_dict(),
+        "config": model_cfg,
+        "losses": all_losses,
+        "timestamp": timestamp,
+    }, checkpoint_path)
+    print(f"\n✅ Model checkpoint saved → {checkpoint_path}")
+
+    # ============================================================
+    # Final Alpha Analysis (if residual path enabled)
+    # ============================================================
+    if getattr(model_cfg, "enable_residual_path", False) and getattr(model_cfg, "use_ascender", False):
+        print("\n" + "="*80)
+        print("FINAL ALPHA ANALYSIS")
+        print("="*80)
+
+        all_alphas = []
+        layer_info = []
+
+        # Encoder
+        for i, layer in enumerate(model.encoder.layers):
+            if hasattr(layer.self_attn, "alpha_logit") and layer.self_attn.biaser is not None:
+                alpha = torch.sigmoid(layer.self_attn.alpha_logit.detach()).cpu().numpy()
+                all_alphas.extend(alpha.tolist())
+                layer_info.append(f"Encoder L{i}: mean α = {alpha.mean():.4f} [{alpha.min():.3f}, {alpha.max():.3f}]")
+
+        # Decoder
+        for i, layer in enumerate(model.decoder.layers):
+            if hasattr(layer.self_attn, "alpha_logit") and layer.self_attn.biaser is not None:
+                alpha = torch.sigmoid(layer.self_attn.alpha_logit.detach()).cpu().numpy()
+                all_alphas.extend(alpha.tolist())
+                layer_info.append(f"Decoder L{i} (self): mean α = {alpha.mean():.4f} [{alpha.min():.3f}, {alpha.max():.3f}]")
+
+        if all_alphas:
+            all_alphas = np.array(all_alphas)
+            mean_alpha = all_alphas.mean()
+
+            print("\nPer-layer α summary:")
+            for info in layer_info:
+                print(f"  {info}")
+
+            print(f"\n📊 Overall Statistics:")
+            print(f"  Mean α:   {mean_alpha:.4f}")
+            print(f"  Median α: {np.median(all_alphas):.4f}")
+            print(f"  Std α:    {all_alphas.std():.4f}")
+            print(f"  Min α:    {all_alphas.min():.4f}")
+            print(f"  Max α:    {all_alphas.max():.4f}")
+
+            print(f"\n🎯 INTERPRETATION:")
+            if mean_alpha > 0.95:
+                print("  ❌ Spatial bias COMPLETELY IGNORED (α > 0.95)")
+                print("  → Model learned spatial structure provides ZERO value")
+                print("  → Boids-inspired biases don't help this task")
+            elif mean_alpha > 0.85:
+                print("  ⚠️  Spatial bias MOSTLY IGNORED (α > 0.85)")
+                print("  → Model learned spatial structure provides minimal value")
+            elif mean_alpha > 0.70:
+                print("  📊 WEAK spatial bias influence (α > 0.70)")
+                print("  → Model prefers learned attention with minor spatial hints")
+            elif mean_alpha > 0.30:
+                print("  ⚖️  BALANCED mixing (0.30 < α < 0.70)")
+                print("  → Model finds value in combining both signals")
+            elif mean_alpha > 0.15:
+                print("  📈 STRONG spatial bias influence (α < 0.30)")
+                print("  → Model relies heavily on spatial structure")
+            else:
+                print("  🎯 Spatial bias DOMINATES (α < 0.15)")
+                print("  → Spatial structure more valuable than learned patterns!")
+
+            print("="*80)
+
+            # Save comprehensive report
+            report_path = f"logs/alpha/FINAL_ANALYSIS_seed{seed}.txt"
+            with open(report_path, "w") as f:
+                f.write("="*80 + "\n")
+                f.write("FINAL ALPHA ANALYSIS - RESIDUAL BIAS PATH\n")
+                f.write("="*80 + "\n\n")
+                f.write(f"Experiment: {cfg.experiment.name}\n")
+                f.write(f"Seed: {seed}\n")
+                f.write(f"Timestamp: {timestamp}\n\n")
+                f.write("Per-layer α summary:\n")
+                for info in layer_info:
+                    f.write(f"  {info}\n")
+                f.write(f"\nOverall Statistics:\n")
+                f.write(f"  Mean α:   {mean_alpha:.4f}\n")
+                f.write(f"  Median α: {np.median(all_alphas):.4f}\n")
+                f.write(f"  Std α:    {all_alphas.std():.4f}\n")
+                f.write(f"  Min α:    {all_alphas.min():.4f}\n")
+                f.write(f"  Max α:    {all_alphas.max():.4f}\n")
+                f.write(f"\nFinal losses: {all_losses}\n")
+            print(f"✅ Detailed analysis saved → {report_path}\n")
 
     # Save aggregated metrics
     metrics_dir = f"logs/{cfg.mode}_logs"
@@ -582,25 +905,82 @@ def main():
     # Final bias snapshot (optional)
     if getattr(model_cfg, "use_ascender", False):
         print("\n[DEBUG] Checking one sample Ascender bias matrix stats...")
-        first_layer = model.decoder.layers[0]
-        if getattr(first_layer, "biaser_self", None) is not None:
+        # Try encoder first, fallback to decoder
+        first_layer = model.encoder.layers[0]
+        biaser = getattr(first_layer.self_attn, "biaser", None)
+        if biaser is None:
+            first_layer = model.decoder.layers[0]
+            biaser = getattr(first_layer, "biaser_self", None)
+
+        if biaser is not None:
             T = 20
             h = torch.randn((1, T, model.cfg.d_model), device=device, dtype=torch.float32) * 0.01
             qh = first_layer.self_attn._shape(first_layer.self_attn.q_proj(h))
             kh = first_layer.self_attn._shape(first_layer.self_attn.k_proj(h))
-            bias = first_layer.biaser_self(qh, kh, pre_q=h, pre_k=h)[0, 0].detach().cpu()
+
+            # Call biaser (handle different signatures)
+            try:
+                bias_full = biaser(qh, kh, pre_q=h, pre_k=h)
+            except:
+                bias_full = biaser(qh, kh)
+
+            # Extract first head from first batch
+            if bias_full.dim() == 4:  # (B, H, T, T)
+                bias = bias_full[0, 0].detach().cpu()
+            else:  # (B, T, T) or (T, T)
+                bias = bias_full[0].detach().cpu() if bias_full.dim() == 3 else bias_full.detach().cpu()
+
             os.makedirs("logs/heatmaps", exist_ok=True)
-            plt.figure(figsize=(5, 4))
-            im = plt.imshow(bias, cmap="coolwarm", interpolation="nearest")
-            plt.colorbar(im, label="Bias Value")
-            plt.title("Decoder[0] Self-Attn Bias Heatmap")
-            plt.xlabel("Key Position"); plt.ylabel("Query Position")
-            plt.tight_layout()
+
+            # 통계 기반 동적 범위 (mean ± 3σ로 대비 극대화)
+            bias_np = bias.numpy()
+            bias_mean = bias_np.mean()
+            bias_std = bias_np.std()
+
+            # 표준화 후 시각화 (z-score normalization으로 패턴 강조)
+            if bias_std > 1e-6:
+                bias_normalized = (bias_np - bias_mean) / bias_std
+                vmin, vmax = -3, 3  # ±3σ 범위로 고정
+            else:
+                bias_normalized = bias_np
+                vmin, vmax = bias_np.min(), bias_np.max()
+
+            fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+
+            # Determine layer type for title
+            layer_name = "Encoder L0" if hasattr(model.encoder.layers[0].self_attn, 'biaser') and model.encoder.layers[0].self_attn.biaser else "Decoder L0"
+
+            # 왼쪽: 정규화된 전체 히트맵
+            im1 = axes[0].imshow(bias_normalized, cmap="RdBu_r", interpolation="nearest", vmin=vmin, vmax=vmax, aspect='auto')
+            cbar1 = plt.colorbar(im1, ax=axes[0], label="Z-score (σ)")
+            cbar1.ax.tick_params(labelsize=10)
+            axes[0].set_title(f"{layer_name} Bias (Normalized) - Final", fontsize=12, fontweight='bold')
+            axes[0].set_xlabel("Key Position", fontsize=11)
+            axes[0].set_ylabel("Query Position", fontsize=11)
+
+            # 오른쪽: 원본 값 (mean ± 3σ 범위로 클램핑해서 대비 강화)
+            clamp_min = bias_mean - 3 * bias_std
+            clamp_max = bias_mean + 3 * bias_std
+            bias_clamped = np.clip(bias_np, clamp_min, clamp_max)
+
+            im2 = axes[1].imshow(bias_clamped, cmap="coolwarm", interpolation="nearest",
+                                 vmin=clamp_min, vmax=clamp_max, aspect='auto')
+            cbar2 = plt.colorbar(im2, ax=axes[1], label="Bias Value (clamped)")
+            cbar2.ax.tick_params(labelsize=10)
+            axes[1].set_title(f"{layer_name} Raw Values (±3σ) - Final", fontsize=12, fontweight='bold')
+            axes[1].set_xlabel("Key Position", fontsize=11)
+            axes[1].set_ylabel("Query Position", fontsize=11)
+
+            # 통계 정보 추가
+            stats_text = f"μ={bias_mean:.3f}, σ={bias_std:.3f}, min={bias_np.min():.3f}, max={bias_np.max():.3f}"
+            fig.text(0.5, 0.02, stats_text, ha='center', fontsize=10, style='italic')
+
+            plt.tight_layout(rect=[0, 0.03, 1, 1])
             sp = "logs/heatmaps/bias_final.png"
-            plt.savefig(sp); plt.close()
+            plt.savefig(sp, dpi=300); plt.close()
             print(f"[Saved] Final bias heatmap → {sp}")
-            print(f"  Bias stats — mean={float(bias.mean()):.4f}, std={float(bias.std()):.4f}, "
-                  f"min={float(bias.min()):.4f}, max={float(bias.max()):.4f}")
+            print(f"  Bias stats — mean={bias_mean:.4f}, std={bias_std:.4f}, "
+                  f"min={bias_np.min():.4f}, max={bias_np.max():.4f}")
 
     print("\nTraining complete ✅")
 

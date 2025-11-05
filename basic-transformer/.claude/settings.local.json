@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python diagnose_bias.py:*)",
+      "Bash(conda run:*)",
+      "Bash(/opt/anaconda3/envs/ascender/bin/python:*)",
+      "Bash(/opt/anaconda3/envs/ascender311/bin/python:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

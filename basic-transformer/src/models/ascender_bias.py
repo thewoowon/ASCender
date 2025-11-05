@@ -35,13 +35,16 @@ class AscenderBiasConfig:
     temperature: float = 1.0                        # alignment temperature
 
     # ----- Safety clamp (before γ) -----
-    clamp_min: float = -2.0
-    clamp_max: float = 2.0
+    clamp_min: float = -10.0
+    clamp_max: float = 10.0
+
+    # ----- Centering control (disable to preserve global structure) -----
+    enable_centering: bool = False
 
     # ----- Directionality & band-pass -----
     past_only: bool = True
     band_min: Optional[int] = 0
-    band_max: Optional[int] = 48
+    band_max: Optional[int] = 96
 
     # ----- Scaling & per-head options -----
     per_head_scale: bool = False
@@ -51,9 +54,9 @@ class AscenderBiasConfig:
     # ----- Learnable gate σ in [floor..ceiling] via sigmoid -----
     use_gate: bool = True
     per_head_gate: bool = False
-    gate_init: float = -0.6
-    gate_floor: float = 0.30
-    gate_ceiling: float = 0.65
+    gate_init: float = 0.0
+    gate_floor: float = 0.15
+    gate_ceiling: float = 0.85
 
     # ----- Auto-calibration toward target bias/std ratio -----
     use_auto_calibrate: bool = False
@@ -401,8 +404,10 @@ class AscenderBias(nn.Module):
             coh = self._gauss(rel_abs, self.cfg.sigma_coh) * band * dirmask
             bias = bias + float(self.cfg.w_coh) * coh.view(1, 1, T, S)
 
-        # === (B) Stabilize: center & clamp ===
-        bias = bias - bias.mean(dim=-1, keepdim=True)
+        # === (B) Stabilize: optional centering & clamp ===
+        # IMPORTANT: Centering removes global structure! Only use for debugging.
+        if getattr(self.cfg, "enable_centering", False):
+            bias = bias - bias.mean(dim=-1, keepdim=True)
         bias = torch.nan_to_num(bias, nan=0.0, posinf=0.0, neginf=0.0)
         bias = bias.clamp_(float(self.cfg.clamp_min), float(self.cfg.clamp_max))
 
@@ -457,20 +462,23 @@ class AscenderBias(nn.Module):
                             (1.0 - self.cfg.ema_momentum) * r_mean
                         )
 
-                    # tiny log-γ update toward target ratio
+                    # Gentle log-γ update toward target ratio (reduced interference)
                     target = float(self.cfg.target_ratio)
                     lo = float(self.cfg.calibrate_step_clamp_lo)
                     hi = float(self.cfg.calibrate_step_clamp_hi)
                     adj_h = torch.clamp(target / torch.clamp(ratio_h, min=1e-6), min=lo, max=hi)  # (H,)
 
-                    if self.cfg.per_head_scale:
-                        self.gamma_log.data.add_(adj_h.log())
-                    else:
-                        self.gamma_log.data.add_(float(adj_h.mean().item()))
+                    # Reduce step size to 0.1x (gentler calibration, preserve learning)
+                    gentle_adj = (adj_h - 1.0) * 0.1 + 1.0
 
-                    # proportional control on gate
+                    if self.cfg.per_head_scale:
+                        self.gamma_log.data.add_(gentle_adj.log())
+                    else:
+                        self.gamma_log.data.add_(float(gentle_adj.mean().item()))
+
+                    # Proportional control on gate (reduced gain)
                     if self.cfg.use_gate and getattr(self, "gate_param", None) is not None:
-                        k = 0.08
+                        k = 0.02  # Reduced from 0.08 for gentler adjustment
                         err_h = (ratio_h - target)    # >0 too strong → close; <0 too weak → open
                         delta = (-k * err_h)
                         if self.cfg.per_head_gate:

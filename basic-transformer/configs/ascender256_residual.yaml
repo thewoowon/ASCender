@@ -1,0 +1,161 @@
+# ==========================================
+# ASCender + RESIDUAL BIAS PATH Configuration
+# ==========================================
+# Combines:
+# 1. All emergent structure fixes (centering OFF, wider kernels, etc.)
+# 2. Residual Bias Path architecture (solves softmax problem!)
+#
+# This is the ULTIMATE configuration for ASCender!
+
+dataset:
+  name: "wikitext-2-v1"
+  seq_len: 256
+  batch_size: 4
+  vocab_size: 30000
+  num_workers: 2
+  pin_memory: true
+
+mode: additive
+
+experiment:
+  name: ascender_residual_ultimate
+  seeds: [42]
+  epochs: 10
+  batch_size: 4
+  lr: 0.0005
+  lr_asc: 0.001           # Faster learning for bias + α mixing weights
+  warmup_steps: 500
+  clip_grad: 1.2
+  smoothing: 0.00
+
+model:
+  src_vocab_size: 30000
+  tgt_vocab_size: 30000
+
+  d_model: 256
+  n_heads: 8
+  n_layers_enc: 3
+  n_layers_dec: 3
+  d_ff: 1024
+  dropout: 0.05
+
+  pad_id: 0
+
+  # ═══════════════════════════════════════════════════════════════════
+  # ASCender Bias Settings - ENCODER ONLY (Option C)
+  # ═══════════════════════════════════════════════════════════════════
+  # Testing: Bidirectional attention (symmetric neighborhoods!)
+  # This sidesteps the causal asymmetry issue (Issue #8)
+  # ═══════════════════════════════════════════════════════════════════
+  use_ascender: true   # ✅ MUST be true to enable ANY biaser!
+  asc_bias_enc: true   # ✅ Encoder: bidirectional (symmetric)
+  asc_bias_dec_self: false  # ❌ Decoder: disabled (causal asymmetry)
+  asc_bias_dec_cross: false # ❌ Cross: disabled
+
+  # ═══════════════════════════════════════════════════════════════════
+  # 🚀 RESIDUAL BIAS PATH (KEY ARCHITECTURAL FIX!)
+  # ═══════════════════════════════════════════════════════════════════
+  # Solves the softmax problem: instead of bias fighting with learned
+  # attention, they each get their own path and the model learns to mix!
+  #
+  # Architecture: α * softmax(QK) + (1-α) * softmax(QK + BIAS)
+  # where α ∈ [0,1] is learned per-head
+  # ═══════════════════════════════════════════════════════════════════
+  enable_residual_path: true  # ✅ ENABLED!
+
+  # ═══════════════════════════════════════════════════════════════════
+  # Debug / Probes
+  # ═══════════════════════════════════════════════════════════════════
+  probe_every: 100
+
+  asc_cfg:
+    # ══════════════════════════════════════════════════════════════════
+    # ALL THREE BOIDS COMPONENTS FOR EMERGENT STRUCTURE
+    # ══════════════════════════════════════════════════════════════════
+    use_alignment:  false
+    use_separation: true    # ✅ Essential for structure
+    use_cohesion:   true
+
+    # ══════════════════════════════════════════════════════════════════
+    # COMPONENT WEIGHTS
+    # ══════════════════════════════════════════════════════════════════
+    w_align: 3.5            # Semantic clustering
+    w_sep:   1.5            # Repulsion/boundaries
+    w_coh:   5.0            # Local cohesion
+
+    # ══════════════════════════════════════════════════════════════════
+    # SPATIAL KERNELS (WIDENED for linguistic neighborhoods)
+    # ══════════════════════════════════════════════════════════════════
+    sigma_sep: 2.0          # Repulsion: ~4 tokens
+    sigma_coh: 50.0         # Cohesion: ~60 tokens (was 3→6 tokens, TOO NARROW!)
+
+    # ══════════════════════════════════════════════════════════════════
+    # ALIGNMENT OPTIONS
+    # ══════════════════════════════════════════════════════════════════
+    align_source: "qk"
+    temperature: 1.0
+
+    # ══════════════════════════════════════════════════════════════════
+    # CLAMP LIMITS (WIDENED to preserve signal)
+    # ══════════════════════════════════════════════════════════════════
+    clamp_min: -12.0        # ✅ was -2.0 (destroyed 80% of signal!)
+    clamp_max:  12.0
+
+    # ══════════════════════════════════════════════════════════════════
+    # CENTERING CONTROL (DISABLED to preserve global structure)
+    # ══════════════════════════════════════════════════════════════════
+    enable_centering: false # ✅ CRITICAL: allows emergent global patterns
+
+    # ══════════════════════════════════════════════════════════════════
+    # DIRECTIONALITY & BAND-PASS
+    # ══════════════════════════════════════════════════════════════════
+    past_only: true
+    band_min: 0
+    band_max: 128           # ✅ Long-range interactions
+
+    # ══════════════════════════════════════════════════════════════════
+    # PER-HEAD CONTROL
+    # ══════════════════════════════════════════════════════════════════
+    per_head_scale: true    # Each head learns its own γ
+    per_head_gate:  false
+
+    # ══════════════════════════════════════════════════════════════════
+    # SCALING (γ) & GATE (σ)
+    # ══════════════════════════════════════════════════════════════════
+    global_scale_init: 1.0
+    use_gate: true
+    gate_init: 0.0          # Start at 0.5 (balanced)
+    gate_floor: 0.10
+    gate_ceiling: 0.90
+
+    # ══════════════════════════════════════════════════════════════════
+    # ALiBi MIXING (DISABLED - interferes with emergent structure)
+    # ══════════════════════════════════════════════════════════════════
+    use_alibi_mix: false    # ✅ No interference
+    alpha_start: 1.0
+    alpha_end:   1.0
+    alpha_schedule: "none"
+    alpha_total_steps: 0
+
+    # ══════════════════════════════════════════════════════════════════
+    # AUTO-CALIBRATION (SOFTENED to preserve natural gradients)
+    # ══════════════════════════════════════════════════════════════════
+    use_auto_calibrate: false
+    target_ratio: 0.70      # ✅ Allow strong influence
+    calibrate_step_clamp_lo: 0.97  # ✅ Gentle (was 0.90)
+    calibrate_step_clamp_hi: 1.03  # ✅ Gentle (was 1.12)
+    ema_momentum: 0.96
+
+    # ══════════════════════════════════════════════════════════════════
+    # RUNTIME SAFETY / CAPS
+    # ══════════════════════════════════════════════════════════════════
+    hard_max_ratio: 1.0     # ✅ Allow bias equal to attention
+    hard_target_ratio: 0.70
+    gamma_min: 0.50
+    gamma_cap: 8.0
+
+    # ══════════════════════════════════════════════════════════════════
+    # MISC
+    # ══════════════════════════════════════════════════════════════════
+    jitter_std: 0.001
+    std_batch_mean: true

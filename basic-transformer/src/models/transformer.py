@@ -9,9 +9,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.models.architectural_mods import (
+    MultiHeadAttentionWithResidualBias,
+    GatedBiasAttention,
+    MultiScaleBiasAttention,
+    BiasConditionedValueAttention,
+    HierarchicalBiasAttention,
+)
+
 from src.models.ascender_bias import AscenderBias, AscenderBiasConfig
 from src.hooks.attn_probe import AttnProbe
-
 
 # ============================================================
 # Utilities: Probes & Masks
@@ -158,6 +165,17 @@ class MultiHeadAttention(nn.Module):
         # std-match & safety
         self.enable_std_match: bool = True
         self.bias_softcap: float = 6.0
+
+        # ══════════════════════════════════════════════════════════════════
+        # RESIDUAL BIAS PATH (architectural_mods.py Option 1)
+        # ══════════════════════════════════════════════════════════════════
+        # Solves the softmax problem: bias isn't overwhelmed by normalization!
+        # Instead of: attn = softmax(scores + bias)
+        # We compute: α * softmax(scores) + (1-α) * softmax(scores + bias)
+        # Model learns per-head mixing weight α ∈ [0,1]
+        # ══════════════════════════════════════════════════════════════════
+        self.alpha_logit = nn.Parameter(torch.zeros(n_heads))  # per-head mixing
+        self.enable_residual_path: bool = False  # Set True in config to activate
 
         # runtime control (lock)
         self._locked_runtime: bool = False
@@ -383,9 +401,49 @@ class MultiHeadAttention(nn.Module):
             else:
                 self.attn_pre_masked = self.attn_post_masked = None
 
-            # apply bias
-            scores = scores + runtime_bias
+            # ══════════════════════════════════════════════════════════════
+            # RESIDUAL BIAS PATH: Compute both paths if enabled
+            # ══════════════════════════════════════════════════════════════
+            if getattr(self, "enable_residual_path", False):
+                # Path 1: Normal (unbiased) attention
+                scores_normal = scores.clone()
+                if attn_mask is not None:
+                    mask_bh = self._broadcast_mask(attn_mask, scores_normal)
+                    scores_normal = scores_normal.masked_fill(mask_bh, float("-inf"))
+                attn_normal = F.softmax(scores_normal, dim=-1)
+                attn_normal = self.dropout(attn_normal)
+
+                # Path 2: Biased attention
+                scores_biased = scores + runtime_bias
+                if attn_mask is not None:
+                    mask_bh = self._broadcast_mask(attn_mask, scores_biased)
+                    scores_biased = scores_biased.masked_fill(mask_bh, float("-inf"))
+                attn_biased = F.softmax(scores_biased, dim=-1)
+                attn_biased = self.dropout(attn_biased)
+
+                # Learnable per-head mixing: α ∈ [0,1]
+                alpha = torch.sigmoid(self.alpha_logit).view(1, -1, 1, 1)  # (1,H,1,1)
+
+                # Mix attention patterns
+                attn = alpha * attn_normal + (1.0 - alpha) * attn_biased
+
+                # Store for logging (use biased path for probes)
+                self.attn_logits = scores_biased.detach()
+                self.attn_probs = attn.detach()
+                self._alpha_effective = alpha.detach().view(-1)  # (H,) for logging
+
+            else:
+                # Standard path: add bias directly
+                scores = scores + runtime_bias
+                if attn_mask is not None:
+                    mask_bh = self._broadcast_mask(attn_mask, scores)
+                    scores = scores.masked_fill(mask_bh, float("-inf"))
+                self.attn_logits = scores.detach()
+                attn = F.softmax(scores, dim=-1)
+                attn = self.dropout(attn)
+                self.attn_probs = attn.detach()
         else:
+            # No bias case
             self.attn_bias = None
             if attn_mask is not None:
                 pre_masked = scores.masked_fill(attn_mask if attn_mask.dim() == 4 else attn_mask.unsqueeze(1),
@@ -395,15 +453,15 @@ class MultiHeadAttention(nn.Module):
             self.attn_pre_masked = pre_masked.detach()
             self.attn_post_masked = pre_masked.detach()
 
-        # apply mask before softmax
-        if attn_mask is not None:
-            mask_bh = self._broadcast_mask(attn_mask, scores)
-            scores = scores.masked_fill(mask_bh, float("-inf"))
+            # apply mask before softmax
+            if attn_mask is not None:
+                mask_bh = self._broadcast_mask(attn_mask, scores)
+                scores = scores.masked_fill(mask_bh, float("-inf"))
 
-        self.attn_logits = scores.detach()
-        attn = F.softmax(scores, dim=-1)
-        attn = self.dropout(attn)
-        self.attn_probs = attn.detach()
+            self.attn_logits = scores.detach()
+            attn = F.softmax(scores, dim=-1)
+            attn = self.dropout(attn)
+            self.attn_probs = attn.detach()
 
         # V-path micro gain
         if getattr(self, "v_gain_epsilon", 0.0) > 0.0 and getattr(self, "attn_bias", None) is not None:
@@ -613,7 +671,12 @@ class TransformerConfig:
     asc_bias_dec_cross: bool = True
     asc_cfg: AscenderBiasConfig = field(default_factory=AscenderBiasConfig)
 
+    # Residual Bias Path (architectural modification)
+    enable_residual_path: bool = False  # Dual-path attention architecture
+
     probe_every: int = 0  # steps
+
+    std_match_ratio_override: Optional[float] = 0.30  # global override
 
 
 class Transformer(nn.Module):
@@ -645,17 +708,26 @@ class Transformer(nn.Module):
             tie_embeddings=cfg.tie_embeddings,
         )
 
-        # Base per-layer std-match defaults for decoder self-attn (aggressive but coherent)
+        # Base per-layer std-match defaults for decoder self-attn
+        # std_match_ratio controls bias magnitude relative to attention scores std
+        # Rule of thumb: 0.1-0.2 gentle, 0.3-0.5 moderate, 0.6-0.9 aggressive, >1.0 very aggressive
+
+        # Check if config specifies a global std_match_ratio override
+        global_r = getattr(cfg, "std_match_ratio_override", None)
+
         if len(self.decoder.layers) >= 1:
-            self.decoder.layers[0].self_attn.std_match_ratio = 1.6
-            self.decoder.layers[0].self_attn.attn_temperature = 1.05
+            # Default values (can be overridden by config or experiment)
+            self.decoder.layers[0].self_attn.std_match_ratio = global_r if global_r else 0.15
+            self.decoder.layers[0].self_attn.attn_temperature = 1.00
             self.decoder.layers[0].self_attn.sparsify_k_frac = 0.0
             self.decoder.layers[0].self_attn.v_gain_epsilon = 0.0
+            self.decoder.layers[0].self_attn.bias_softcap = 6.0  # Allow higher for aggressive configs
         if len(self.decoder.layers) >= 2:
-            self.decoder.layers[1].self_attn.std_match_ratio = 1.2
-            self.decoder.layers[1].self_attn.attn_temperature = 1.0
+            self.decoder.layers[1].self_attn.std_match_ratio = global_r if global_r else 0.10
+            self.decoder.layers[1].self_attn.attn_temperature = 1.00
             self.decoder.layers[1].self_attn.sparsify_k_frac = 0.0
             self.decoder.layers[1].self_attn.v_gain_epsilon = 0.0
+            self.decoder.layers[1].self_attn.bias_softcap = 6.0
 
         # === ASCender attachment policy ===
         if cfg.use_ascender:
@@ -707,6 +779,22 @@ class Transformer(nn.Module):
                 layer.biaser_cross = None
                 layer.cross_attn.biaser = None
 
+        # ══════════════════════════════════════════════════════════════════
+        # RESIDUAL BIAS PATH: Enable dual-path architecture if requested
+        # ══════════════════════════════════════════════════════════════════
+        if getattr(cfg, "enable_residual_path", False):
+            print("[Init] Residual Bias Path ENABLED (dual-path architecture)")
+            for i, layer in enumerate(self.decoder.layers):
+                if hasattr(layer, "self_attn"):
+                    layer.self_attn.enable_residual_path = True
+                if hasattr(layer, "cross_attn"):
+                    layer.cross_attn.enable_residual_path = True
+            for i, layer in enumerate(self.encoder.layers):
+                if hasattr(layer, "self_attn"):
+                    layer.self_attn.enable_residual_path = True
+        else:
+            print("[Init] Residual Bias Path OFF (standard additive bias)")
+
         # ---- Role tags & expect_bias flags for logging ----
         def _tag(mha: MultiHeadAttention, role: str, expect_bias: bool):
             setattr(mha, "role", role)
@@ -725,17 +813,17 @@ class Transformer(nn.Module):
                  expect_bias=(self.cfg.use_ascender and self.cfg.asc_bias_dec_cross))
 
         # ---- Wiring printout ----
-        for i in range(len(self.decoder.layers)):
-            sa = self.decoder.layers[i].self_attn
-            ca = self.decoder.layers[i].cross_attn
-            print(f"[WIRE] L{i}.self_attn: biaser={type(sa.biaser).__name__ if sa.biaser is not None else None} "
-                  f"| expect_bias={getattr(sa, 'expect_bias', None)} "
-                  f"| r={getattr(sa, 'std_match_ratio', None)} "
-                  f"| tau={getattr(sa, 'attn_temperature', None)} "
-                  f"| topk={getattr(sa, 'sparsify_k_frac', None)} "
-                  f"| v_eps={getattr(sa, 'v_gain_epsilon', None)}")
-            print(f"[WIRE] L{i}.cross_attn: biaser={type(ca.biaser).__name__ if ca.biaser is not None else None} "
-                  f"| expect_bias={getattr(ca, 'expect_bias', None)}")
+        # for i in range(len(self.decoder.layers)):
+        #     sa = self.decoder.layers[i].self_attn
+        #     ca = self.decoder.layers[i].cross_attn
+        #     print(f"[WIRE] L{i}.self_attn: biaser={type(sa.biaser).__name__ if sa.biaser is not None else None} "
+        #           f"| expect_bias={getattr(sa, 'expect_bias', None)} "
+        #           f"| r={getattr(sa, 'std_match_ratio', None)} "
+        #           f"| tau={getattr(sa, 'attn_temperature', None)} "
+        #           f"| topk={getattr(sa, 'sparsify_k_frac', None)} "
+        #           f"| v_eps={getattr(sa, 'v_gain_epsilon', None)}")
+        #     print(f"[WIRE] L{i}.cross_attn: biaser={type(ca.biaser).__name__ if ca.biaser is not None else None} "
+        #           f"| expect_bias={getattr(ca, 'expect_bias', None)}")
 
         # ---- Lock initial runtime (true lock: restored each forward) ----
         try:
@@ -749,26 +837,26 @@ class Transformer(nn.Module):
 
         # ---- Probes (store handles for clean detach) ----
         # ---- Probes (SAFE: do not register probes as submodules) ----
-        try:
-            # keep strong references without making them child modules
-            self._probe_refs = []  # list of (probe_callable, handle)
+        # try:
+        #     # keep strong references without making them child modules
+        #     self._probe_refs = []  # list of (probe_callable, handle)
 
-            def _attach_probe_safe(mha, name: str, every: int = 50):
-                # Create the probe instance
-                probe = AttnProbe(name, every=every)
-                # Register its __call__ as a forward hook (callable)
-                handle = mha.register_forward_hook(probe)
-                # Keep refs in a plain Python list so it won't be treated as a child module
-                self._probe_refs.append((probe, handle))
+        #     def _attach_probe_safe(mha, name: str, every: int = 50):
+        #         # Create the probe instance
+        #         probe = AttnProbe(name, every=every)
+        #         # Register its __call__ as a forward hook (callable)
+        #         handle = mha.register_forward_hook(probe)
+        #         # Keep refs in a plain Python list so it won't be treated as a child module
+        #         self._probe_refs.append((probe, handle))
 
-            # AFTER: cfg.model.get("probe_every", 0) > 0 일 때만
-            probe_every = getattr(self.cfg, "probe_every", 50)
-            if probe_every and len(self.decoder.layers) >= 1:
-                _attach_probe_safe(self.decoder.layers[0].self_attn, "decoder.self_attn.layer0", every=probe_every)
-            if probe_every and len(self.decoder.layers) >= 2:
-                _attach_probe_safe(self.decoder.layers[1].self_attn, "decoder.self_attn.layer1", every=probe_every)
-        except Exception as e:
-            print(f"[Probe] attach failed: {e}")
+        #     # AFTER: cfg.model.get("probe_every", 0) > 0 일 때만
+        #     probe_every = getattr(self.cfg, "probe_every", 50)
+        #     if probe_every and len(self.decoder.layers) >= 1:
+        #         _attach_probe_safe(self.decoder.layers[0].self_attn, "decoder.self_attn.layer0", every=probe_every)
+        #     if probe_every and len(self.decoder.layers) >= 2:
+        #         _attach_probe_safe(self.decoder.layers[1].self_attn, "decoder.self_attn.layer1", every=probe_every)
+        # except Exception as e:
+        #     print(f"[Probe] attach failed: {e}")
 
         self._reset_parameters()
 

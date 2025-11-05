@@ -1,0 +1,53 @@
+# ==========================================
+# Baseline Configuration (NO ASCender)
+# Use this to measure performance improvement
+# ==========================================
+
+dataset:
+  name: "wikitext-2-v1"
+  seq_len: 128
+  batch_size: 8
+  vocab_size: 30000
+  num_workers: 2
+  pin_memory: true
+
+mode: additive
+
+experiment:
+  name: baseline_no_asc
+  seeds: [42, 43, 44]
+  epochs: 10
+  batch_size: 8
+  lr: 0.0005
+  lr_asc: 0.0005
+  warmup_steps: 200
+  clip_grad: 0.8
+  smoothing: 0.0
+
+model:
+  src_vocab_size: 30000
+  tgt_vocab_size: 30000
+  d_model: 256
+  n_heads: 8
+  n_layers_enc: 3
+  n_layers_dec: 3
+  d_ff: 1024
+  dropout: 0.1
+  pad_id: 0
+
+  # === ASCender DISABLED ===
+  use_ascender: false
+  asc_bias_enc: false
+  asc_bias_dec_self: false
+  asc_bias_dec_cross: false
+
+  probe_every: 0
+
+  # Empty config (won't be used)
+  asc_cfg:
+    use_alignment: false
+    use_separation: false
+    use_cohesion: false
+    w_align: 0.0
+    w_sep: 0.0
+    w_coh: 0.0
