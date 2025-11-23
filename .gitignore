@@ -28,3 +28,6 @@ terraform.rc
 
 *.pem
 # Ignore CLI configuration files
+
+point-cloud-ascender/data/
+point-cloud-ascender/src/data/

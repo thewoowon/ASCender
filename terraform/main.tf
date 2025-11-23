@@ -117,13 +117,18 @@ resource "aws_autoscaling_group" "gpu_asg" {
   vpc_zone_identifier = [var.subnet_id]
   health_check_type   = "EC2"
   mixed_instances_policy {
-    instances_distribution { spot_allocation_strategy = "capacity-optimized" }
+    instances_distribution {
+      spot_allocation_strategy = "capacity-optimized"
+      on_demand_base_capacity = 1  # 첫 1대는 on-demand로
+      on_demand_percentage_above_base_capacity = 0
+    }
     launch_template {
       launch_template_specification {
         launch_template_id = aws_launch_template.gpu_lt.id
         version            = "$Latest"
       }
       override { instance_type = "g5.xlarge" }
+      override { instance_type = "g4dn.xlarge" }  # 대체 옵션
     }
   }
 }

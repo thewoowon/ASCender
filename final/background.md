@@ -140,5 +140,3 @@ B_h ;=; \beta_\mathrm{A},B^\text{align}*h;+;\beta*\mathrm{S},B^\text{sep}*h;+;\b
 여기서 (\beta_\cdot)는 학습되거나 사전 설정되는 조절 계수다.
 
 ---
-
-👉 이제 이어서 **5. ASCender Model**을 한국어로 번역해드릴까요? (수식 정식화 + 알고리즘 의사코드 포함)

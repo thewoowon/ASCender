@@ -1,0 +1,38 @@
+{
+  "Moderate (3x)": {
+    "accuracy": 0.48,
+    "alpha": 0.5,
+    "alpha_history": [
+      0.5,
+      0.5,
+      0.5,
+      0.5,
+      0.5
+    ],
+    "improvement": -0.04500000000000004
+  },
+  "Strong (5x)": {
+    "accuracy": 0.48,
+    "alpha": 0.5,
+    "alpha_history": [
+      0.5,
+      0.5,
+      0.5,
+      0.5,
+      0.5
+    ],
+    "improvement": -0.04500000000000004
+  },
+  "Very Strong (10x)": {
+    "accuracy": 0.48,
+    "alpha": 0.5,
+    "alpha_history": [
+      0.5,
+      0.5,
+      0.5,
+      0.5,
+      0.5
+    ],
+    "improvement": -0.04500000000000004
+  }
+}

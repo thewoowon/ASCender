@@ -1,0 +1,66 @@
+{
+  "component_ablation": {
+    "Baseline (No ASC)": {
+      "accuracy": 0.445,
+      "alpha": null
+    },
+    "Alignment Only (A)": {
+      "accuracy": 0.465,
+      "alpha": 0.6340311169624329
+    },
+    "Separation Only (S)": {
+      "accuracy": 0.49,
+      "alpha": 0.6342751979827881
+    },
+    "Cohesion Only (C)": {
+      "accuracy": 0.46,
+      "alpha": 0.5634949803352356
+    },
+    "A + S": {
+      "accuracy": 0.485,
+      "alpha": 0.656010091304779
+    },
+    "A + C": {
+      "accuracy": 0.51,
+      "alpha": 0.5723792314529419
+    },
+    "S + C": {
+      "accuracy": 0.49,
+      "alpha": 0.5972765684127808
+    },
+    "A + S + C (Full)": {
+      "accuracy": 0.465,
+      "alpha": 0.5908130407333374
+    }
+  },
+  "level_ablation": {
+    "Baseline (No Levels)": {
+      "accuracy": 0.455,
+      "alpha": null
+    },
+    "L1: Graph Only": {
+      "accuracy": 0.48,
+      "alpha": 0.5
+    },
+    "L2: Kernel Only": {
+      "accuracy": 0.47,
+      "alpha": 0.600049614906311
+    },
+    "L3: Value Only": {
+      "accuracy": 0.465,
+      "alpha": 0.574383020401001
+    },
+    "L1 + L2": {
+      "accuracy": 0.475,
+      "alpha": 0.6025711894035339
+    },
+    "L2 + L3": {
+      "accuracy": 0.48,
+      "alpha": 0.5269145965576172
+    },
+    "L1 + L2 + L3 (Full)": {
+      "accuracy": 0.47,
+      "alpha": 0.5882103443145752
+    }
+  }
+}

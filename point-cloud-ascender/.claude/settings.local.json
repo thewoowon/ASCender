@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m experiments.test_ascender_minimal:*)",
+      "Bash(/opt/anaconda3/envs/point311/bin/python -m experiments.test_ascender_minimal)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

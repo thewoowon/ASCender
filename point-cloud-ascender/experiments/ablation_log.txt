@@ -1,0 +1,146 @@
+======================================================================
+               ABLATION STUDY - ASCender v2.0
+======================================================================
+
+This is the KEY analysis for the paper!
+  1. Component Ablation (A/S/C)
+  2. Level Ablation (L1/L2/L3)
+  3. α Evolution Analysis
+======================================================================
+
+Device: cpu
+
+📊 Generating dataset...
+
+======================================================================
+                    PART 1: COMPONENT ABLATION
+======================================================================
+
+🚀 Testing: Baseline (No ASC)
+   Accuracy: 0.445, α: N/A
+
+🚀 Testing: Alignment Only (A)
+   Accuracy: 0.465, α: 0.6338
+
+🚀 Testing: Separation Only (S)
+   Accuracy: 0.490, α: 0.6342
+
+🚀 Testing: Cohesion Only (C)
+   Accuracy: 0.475, α: 0.5628
+
+🚀 Testing: A + S
+   Accuracy: 0.475, α: 0.6561
+
+🚀 Testing: A + C
+   Accuracy: 0.500, α: 0.5724
+
+🚀 Testing: S + C
+   Accuracy: 0.500, α: 0.5970
+
+🚀 Testing: A + S + C (Full)
+   Accuracy: 0.480, α: 0.5908
+
+======================================================================
+                    PART 2: LEVEL ABLATION
+======================================================================
+
+🚀 Testing: Baseline (No Levels)
+   Accuracy: 0.460, α: N/A
+
+🚀 Testing: L1: Graph Only
+   Accuracy: 0.495, α: 0.5000
+
+🚀 Testing: L2: Kernel Only
+   Accuracy: 0.475, α: 0.6001
+
+🚀 Testing: L3: Value Only
+   Accuracy: 0.475, α: 0.5742
+
+🚀 Testing: L1 + L2
+   Accuracy: 0.475, α: 0.6026
+
+🚀 Testing: L2 + L3
+   Accuracy: 0.485, α: 0.5269
+
+🚀 Testing: L1 + L2 + L3 (Full)
+   Accuracy: 0.465, α: 0.5880
+
+======================================================================
+                         RESULTS SUMMARY
+======================================================================
+
+📊 COMPONENT ABLATION (A/S/C):
+----------------------------------------------------------------------
+Baseline (No ASC)    | Acc: 0.445 (Δ +0.000) | α: N/A
+Alignment Only (A)   | Acc: 0.465 (Δ +0.020) | α: 0.6338
+Separation Only (S)  | Acc: 0.490 (Δ +0.045) | α: 0.6342
+Cohesion Only (C)    | Acc: 0.475 (Δ +0.030) | α: 0.5628
+A + S                | Acc: 0.475 (Δ +0.030) | α: 0.6561
+A + C                | Acc: 0.500 (Δ +0.055) | α: 0.5724
+S + C                | Acc: 0.500 (Δ +0.055) | α: 0.5970
+A + S + C (Full)     | Acc: 0.480 (Δ +0.035) | α: 0.5908
+
+✅ Best Component Config: A + C
+   Accuracy: 0.500
+
+📊 LEVEL ABLATION (L1/L2/L3):
+----------------------------------------------------------------------
+Baseline (No Levels)      | Acc: 0.460 (Δ +0.015) | α: N/A
+L1: Graph Only            | Acc: 0.495 (Δ +0.050) | α: 0.5000
+L2: Kernel Only           | Acc: 0.475 (Δ +0.030) | α: 0.6001
+L3: Value Only            | Acc: 0.475 (Δ +0.030) | α: 0.5742
+L1 + L2                   | Acc: 0.475 (Δ +0.030) | α: 0.6026
+L2 + L3                   | Acc: 0.485 (Δ +0.040) | α: 0.5269
+L1 + L2 + L3 (Full)       | Acc: 0.465 (Δ +0.020) | α: 0.5880
+
+✅ Best Level Config: L1: Graph Only
+   Accuracy: 0.495
+
+======================================================================
+                         KEY INSIGHTS
+======================================================================
+
+1️⃣  Component Contributions:
+   ✅ Separation (S) is the strongest individual component
+   ⚠️  Components may be redundant
+
+2️⃣  Level Contributions:
+   ✅ Level 1 (Graph) is the strongest level
+
+3️⃣  α Behavior:
+   Mean α: 0.6067 ± 0.0325
+   → Models generally prefer learned attention
+
+======================================================================
+💾 Results saved to results/ablation_results.json
+
+======================================================================
+                    PAPER-READY SUMMARY
+======================================================================
+
+📝 For Table 1 (Component Ablation):
+   | Component | Accuracy | Δ vs Baseline | α     |
+   |-----------|----------|---------------|-------|
+   | Baseline (No ASC) | 0.445    | +0.000         |   -   |
+   | Alignment Only (A) | 0.465    | +0.020         | 0.6338 |
+   | Separation Only (S) | 0.490    | +0.045         | 0.6342 |
+   | Cohesion Only (C) | 0.475    | +0.030         | 0.5628 |
+   | A + S         | 0.475    | +0.030         | 0.6561 |
+   | A + C         | 0.500    | +0.055         | 0.5724 |
+   | S + C         | 0.500    | +0.055         | 0.5970 |
+   | A + S + C (Full) | 0.480    | +0.035         | 0.5908 |
+
+📝 For Table 2 (Level Ablation):
+   | Level Config    | Accuracy | Δ vs Baseline | α     |
+   |-----------------|----------|---------------|-------|
+   | Baseline (No Levels) | 0.460    | +0.015         |   -   |
+   | L1: Graph Only  | 0.495    | +0.050         | 0.5000 |
+   | L2: Kernel Only | 0.475    | +0.030         | 0.6001 |
+   | L3: Value Only  | 0.475    | +0.030         | 0.5742 |
+   | L1 + L2         | 0.475    | +0.030         | 0.6026 |
+   | L2 + L3         | 0.485    | +0.040         | 0.5269 |
+   | L1 + L2 + L3 (Full) | 0.465    | +0.020         | 0.5880 |
+
+======================================================================
+✅ Ablation study complete!
+======================================================================

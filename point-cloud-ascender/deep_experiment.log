@@ -1,0 +1,25 @@
+================================================================================
+🚀 MSRAction3D DEEP Architecture Experiment
+================================================================================
+
+📁 Data root: src/data/Depth/
+📱 Device: cpu
+🔢 Epochs: 50
+📦 Batch size: 4
+🔹 Points per frame: 384
+🎞️  Frames per sequence: 12
+💪 Strong bias: Yes (2x)
+🏗️  Architecture: 3-layer + Temporal Transformer + d_model=256
+
+📂 Loading datasets...
+MSRAction3D train split: 270 sequences
+MSRAction3D test split: 297 sequences
+   Train: 270 sequences
+   Test:  297 sequences
+
+🏗️  Building models...
+   Baseline: 3,229,076 parameters
+   ASCender: 3,229,316 parameters (+240)
+
+🏋️  Training...
+

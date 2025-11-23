@@ -1,0 +1,20 @@
+======================================================================
+               ModelNet40 Experiment - ASCender v2.0
+======================================================================
+
+Goal: Validate on real dataset + test model size effect
+======================================================================
+
+Device: cpu
+
+📥 Preparing ModelNet40...
+📥 Downloading ModelNet40 from https://shapenet.cs.stanford.edu/media/modelnet40_ply_hdf5_2048.zip
+   (This may take a while...)
+❌ Download failed: <urlopen error [Errno 60] Operation timed out>
+
+Please manually download from:
+  https://shapenet.cs.stanford.edu/media/modelnet40_ply_hdf5_2048.zip
+  and extract to: data/modelnet40
+
+⚠️  Please install h5py and download ModelNet40 manually
+   pip install h5py
