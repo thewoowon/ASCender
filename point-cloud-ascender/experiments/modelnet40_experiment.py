@@ -35,14 +35,17 @@ from tiny_model_with_rbp import TinyPointTransformerRBP
 # ModelNet40 Data Loader
 # ============================================================================
 
-def download_modelnet40(data_dir="data/modelnet40"):
-    """Download ModelNet40 dataset"""
+def download_modelnet40(data_dir="data/modelnet40_ply_hdf5_2048"):
+    """Check ModelNet40 dataset"""
     data_dir = Path(data_dir)
-    data_dir.mkdir(parents=True, exist_ok=True)
 
-    url = "https://shapenet.cs.stanford.edu/media/modelnet40_ply_hdf5_2048.zip"
-    zip_path = data_dir / "modelnet40.zip"
+    # Check if data exists
+    if (data_dir / "ply_data_train0.h5").exists():
+        print("✅ ModelNet40 found")
+        return data_dir
 
+    # Fallback to old path
+    data_dir = Path("data/modelnet40")
     if (data_dir / "ply_data_train0.h5").exists():
         print("✅ ModelNet40 already downloaded")
         return data_dir
@@ -391,7 +394,8 @@ def main():
                 _, test_acc = eval_model(ascender, test_loader, criterion, device)
                 alpha = ascender.get_alpha()
                 alpha_history.append(alpha if alpha else 0.5)
-                print(f"   Epoch {epoch+1}: Test Acc = {test_acc:.3f}, α = {alpha:.4f if alpha else 'N/A'}")
+                alpha_str = f"{alpha:.4f}" if alpha is not None else "N/A"
+                print(f"   Epoch {epoch+1}: Test Acc = {test_acc:.3f}, α = {alpha_str}")
 
         _, ascender_acc = eval_model(ascender, test_loader, criterion, device)
         final_alpha = ascender.get_alpha()
@@ -408,7 +412,8 @@ def main():
         print(f"\n📊 Results for {name}:")
         print(f"   Baseline:  {baseline_acc:.3f}")
         print(f"   ASCender:  {ascender_acc:.3f} (Δ {results[name]['improvement']:+.3f})")
-        print(f"   α:         {final_alpha:.4f if final_alpha else 'N/A'}")
+        alpha_display = f"{final_alpha:.4f}" if final_alpha is not None else "N/A"
+        print(f"   α:         {alpha_display}")
 
     # Summary
     print("\n" + "="*70)

@@ -1,0 +1,26 @@
+{
+  "Small (5K)": {
+    "hidden_dim": 32,
+    "params": 5494,
+    "baseline_acc": 0.47,
+    "ascender_acc": 0.54,
+    "alpha": 0.31721436977386475,
+    "improvement": 0.07000000000000006
+  },
+  "Medium (50K)": {
+    "hidden_dim": 128,
+    "params": 77230,
+    "baseline_acc": 0.54,
+    "ascender_acc": 0.45,
+    "alpha": 0.4197719395160675,
+    "improvement": -0.09000000000000002
+  },
+  "Large (200K)": {
+    "hidden_dim": 256,
+    "params": 301902,
+    "baseline_acc": 0.475,
+    "ascender_acc": 0.435,
+    "alpha": 0.4862985908985138,
+    "improvement": -0.03999999999999998
+  }
+}

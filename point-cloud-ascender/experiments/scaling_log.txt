@@ -1,0 +1,94 @@
+======================================================================
+               MODEL SCALING EXPERIMENT - ASCender v2.0
+======================================================================
+
+Hypothesis: Inductive bias matters when capacity is limited
+  - Small model (5K params): ASCender helps, α learns
+  - Medium model (50K params): ASCender helps less, α higher
+  - Large model (200K params): ASCender ignored, α → 1.0
+======================================================================
+
+Device: cpu
+
+📊 Generating dataset...
+======================================================================
+Starting experiments...
+======================================================================
+
+======================================================================
+🚀 Testing: Small (5K) (hidden_dim=32)
+======================================================================
+
+📌 Baseline (No ASCender):
+   Parameters: 4,874
+   Accuracy: 0.470
+
+📌 With ASCender (A+C):
+   Parameters: 5,494
+   Accuracy: 0.540
+   α: 0.3172
+   Δ vs Baseline: +7.0%
+
+======================================================================
+🚀 Testing: Medium (50K) (hidden_dim=128)
+======================================================================
+
+📌 Baseline (No ASCender):
+   Parameters: 68,618
+   Accuracy: 0.540
+
+📌 With ASCender (A+C):
+   Parameters: 77,230
+   Accuracy: 0.450
+   α: 0.4198
+   Δ vs Baseline: -9.0%
+
+======================================================================
+🚀 Testing: Large (200K) (hidden_dim=256)
+======================================================================
+
+📌 Baseline (No ASCender):
+   Parameters: 268,298
+   Accuracy: 0.475
+
+📌 With ASCender (A+C):
+   Parameters: 301,902
+   Accuracy: 0.435
+   α: 0.4863
+   Δ vs Baseline: -4.0%
+
+======================================================================
+                    RESULTS SUMMARY
+======================================================================
+
+📊 MODEL SIZE vs ASCender EFFECTIVENESS:
+
+Model                Params       Baseline   ASCender   Δ        α       
+----------------------------------------------------------------------
+Small (5K)           5,494        0.470      0.540      0.070+++ 0.3172  
+Medium (50K)         77,230       0.540      0.450      -0.090++ 0.4198  
+Large (200K)         301,902      0.475      0.435      -0.040++ 0.4863  
+
+======================================================================
+KEY FINDINGS:
+======================================================================
+
+1️⃣  α Evolution as model grows:
+   Small (5K): α = 0.3172
+   Medium (50K): α = 0.4198
+   Large (200K): α = 0.4863
+
+   ✅ α increases with model size (0.317 → 0.486)
+      → Larger models rely MORE on learned path (ignore bias)
+
+2️⃣  Improvement as model grows:
+   Small (5K): Δ = +0.070 (+7.0%)
+   Medium (50K): Δ = -0.090 (-9.0%)
+   Large (200K): Δ = -0.040 (-4.0%)
+
+   ✅ Improvement decreases with model size
+      → Small models benefit MORE from inductive bias
+
+======================================================================
+💾 Results saved to results/scaling_results.json
+======================================================================

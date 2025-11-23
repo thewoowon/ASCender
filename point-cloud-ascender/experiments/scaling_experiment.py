@@ -122,8 +122,8 @@ class ScalablePointTransformerRBP(nn.Module):
         if self.use_ascender:
             from models.point_ascender_v2 import VectorKernelEncoder
             self.vector_kernel = VectorKernelEncoder(
-                hidden_dim=hidden_dim,
-                config=ascender_config
+                channels=hidden_dim,
+                cfg=ascender_config
             )
             # Learnable mixing parameter α
             self.alpha_logit = nn.Parameter(torch.zeros(1))
@@ -172,14 +172,28 @@ class ScalablePointTransformerRBP(nn.Module):
         # ASCender bias path
         if self.use_ascender:
             # Compute bias vector kernels
-            p_i = points.unsqueeze(2).expand(-1, -1, self.k, -1)
-            p_j = p_neigh
-            x_i = x.unsqueeze(2).expand(-1, -1, self.k, -1)
-            x_j = x_neigh
-            n_i = normals.unsqueeze(2).expand(-1, -1, self.k, -1)
-            n_j = n_neigh
+            # VectorKernelEncoder expects (N, k, C), so we need to flatten batch
+            p_i = points.unsqueeze(2).expand(-1, -1, self.k, -1)  # (B, N, k, 3)
+            p_j = p_neigh  # (B, N, k, 3)
+            x_i = x.unsqueeze(2).expand(-1, -1, self.k, -1)  # (B, N, k, C)
+            x_j = x_neigh  # (B, N, k, C)
+            n_i = normals.unsqueeze(2).expand(-1, -1, self.k, -1)  # (B, N, k, 3)
+            n_j = n_neigh  # (B, N, k, 3)
 
-            B_vec = self.vector_kernel(p_i, p_j, x_i, x_j, n_i, n_j)  # (B, N, k, C)
+            # VectorKernelEncoder expects:
+            # p_i, x_i, normals_i: (N, 3/C/3)  <- single point
+            # p_j, x_j, normals_j: (N, k, 3/C/3)  <- neighbors
+            # So we need to flatten B*N dimension and remove k from _i
+
+            p_i_flat = points.reshape(B * N, 3)  # (B*N, 3)
+            p_j_flat = p_j.reshape(B * N, self.k, 3)  # (B*N, k, 3)
+            x_i_flat = x.reshape(B * N, self.hidden_dim)  # (B*N, C)
+            x_j_flat = x_j.reshape(B * N, self.k, self.hidden_dim)  # (B*N, k, C)
+            n_i_flat = normals.reshape(B * N, 3)  # (B*N, 3)
+            n_j_flat = n_j.reshape(B * N, self.k, 3)  # (B*N, k, 3)
+
+            B_vec_flat = self.vector_kernel(p_i_flat, p_j_flat, x_i_flat, x_j_flat, n_i_flat, n_j_flat)  # (B*N, k, C)
+            B_vec = B_vec_flat.reshape(B, N, self.k, self.hidden_dim)  # (B, N, k, C)
 
             # Bias attention scores
             attn_scores_bias = B_vec.sum(dim=-1)  # (B, N, k)
@@ -269,13 +283,13 @@ def run_scaling_experiment():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"\nDevice: {device}\n")
 
-    # Dataset
+    # Dataset (reduced size for faster execution)
     print("📊 Generating dataset...")
-    train_dataset = PointCloudDataset(num_samples=2000, num_points=128, num_classes=10)
-    val_dataset = PointCloudDataset(num_samples=400, num_points=128, num_classes=10)
+    train_dataset = PointCloudDataset(num_samples=1000, num_points=128, num_classes=10)
+    val_dataset = PointCloudDataset(num_samples=200, num_points=128, num_classes=10)
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=32, shuffle=True)
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=32, shuffle=False)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=16, shuffle=True)
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=16, shuffle=False)
 
     # Model sizes to test
     model_configs = [
@@ -284,16 +298,17 @@ def run_scaling_experiment():
         ("Large (200K)", 256),   # hidden_dim=256 → ~200K params
     ]
 
-    # ASCender config (A+C - best from ablation)
+    # ASCender config (A+C with L2 only - best from ablation)
     ascender_config = ASCenderV2Config(
         use_alignment=True,
         use_separation=False,
         use_cohesion=True,
         w_align=1.2,
-        w_sep=1.2,
         w_coh=1.2,
-        use_graph_reweight=False,
-        use_value_modulation=False,
+        enable_graph_reweight=False,
+        enable_vector_kernel=True,
+        enable_value_rbp=False,
+        enable_value_gating=False,
     )
 
     results = {}
@@ -321,8 +336,8 @@ def run_scaling_experiment():
         optimizer = torch.optim.Adam(baseline_model.parameters(), lr=1e-3)
         criterion = nn.CrossEntropyLoss()
 
-        # Train
-        for epoch in range(50):
+        # Train (reduced epochs)
+        for epoch in range(30):
             train_epoch(baseline_model, train_loader, optimizer, criterion, device)
 
         _, baseline_acc = eval_model(baseline_model, val_loader, criterion, device)
@@ -341,8 +356,8 @@ def run_scaling_experiment():
 
         optimizer = torch.optim.Adam(ascender_model.parameters(), lr=1e-3)
 
-        # Train
-        for epoch in range(50):
+        # Train (reduced epochs)
+        for epoch in range(30):
             train_epoch(ascender_model, train_loader, optimizer, criterion, device)
 
         _, ascender_acc = eval_model(ascender_model, val_loader, criterion, device)

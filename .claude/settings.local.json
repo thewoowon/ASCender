@@ -5,7 +5,10 @@
       "Bash(conda env:*)",
       "Bash(conda info:*)",
       "Bash(pip install:*)",
-      "Bash(tee:*)"
+      "Bash(tee:*)",
+      "Bash(cat:*)",
+      "Bash(kill:*)",
+      "Bash(pkill:*)"
     ],
     "deny": [],
     "ask": []
