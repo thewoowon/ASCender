@@ -472,16 +472,18 @@ class PointTransformerLayerASC(nn.Module):
         )  # (n, nsample, out_planes)
 
         # Split position and features
-        p_r = x_k_grouped[:, :, 0:3]  # (n, nsample, 3) - relative positions
+        p_r_raw = x_k_grouped[:, :, 0:3]  # (n, nsample, 3) - RAW relative positions (PRESERVE THIS!)
         x_k_grouped = x_k_grouped[:, :, 3:]  # (n, nsample, mid_planes)
 
         # Position encoding δ_ij = θ(p_i - p_j)
+        p_r = p_r_raw  # Start with raw positions for encoding
         for i, layer in enumerate(self.linear_p):
             if i == 1:
                 p_r = layer(p_r.transpose(1, 2).contiguous()).transpose(1, 2).contiguous()
             else:
                 p_r = layer(p_r)
-        # p_r now (n, nsample, out_planes)
+        # p_r now (n, nsample, out_planes) - TRANSFORMED for positional encoding
+        # p_r_raw still (n, nsample, 3) - PRESERVED for ASC calculations
 
         # ===== CORE RELATION: w = x_k - x_q + p_r =====
         # This is: rel_ij = ψ(x_j) - φ(x_i) + δ_ij
@@ -491,26 +493,42 @@ class PointTransformerLayerASC(nn.Module):
         ).sum(2)  # (n, nsample, mid_planes)
 
         # ===== ASCender v2.0 Intervention =====
+        # Gather normals if available (needed for both Level 1 and Level 2)
+        normals_grouped = None
+        if self.use_ascender and normals is not None:
+            normals_grouped = pointops.queryandgroup(
+                self.nsample, p, p, normals, None, o, o, use_xyz=False
+            )  # (n, nsample, 3)
+
+        # Level 1: Graph Reweighting (modify neighbors before attention)
+        if self.use_ascender and self.cfg.enable_graph_reweight:
+            # Compute ASC-based neighbor scores
+            p_i = p.unsqueeze(1).expand(-1, self.nsample, -1)  # (n, nsample, 3)
+            p_j = p_i + p_r_raw  # Use preserved raw coordinates
+
+            graph_scores = self.graph_reweight(
+                p_i=p,  # (n, 3)
+                p_j=p_j,  # (n, nsample, 3)
+                x_i=x,  # (n, c)
+                x_j=x_k_grouped + x.unsqueeze(1),  # Reconstruct absolute features
+                normals_i=normals,
+                normals_j=normals_grouped,
+            )  # (n, nsample)
+
+            # Apply graph scores as multiplicative gating to grouped features
+            # This modulates the importance of each neighbor
+            x_k_grouped = x_k_grouped * graph_scores.unsqueeze(-1)
+            x_v_grouped = x_v_grouped * graph_scores.unsqueeze(-1)
+
+        # Level 2: Vector Kernel (compute B_vec for attention bias)
         if self.use_ascender and self.cfg.enable_vector_kernel:
-            # Gather normals if available
-            normals_grouped = None
-            if normals is not None:
-                normals_grouped = pointops.queryandgroup(
-                    self.nsample, p, p, normals, None, o, o, use_xyz=False
-                )  # (n, nsample, 3)
-
-            # Compute vector kernel B_vec
-            # Note: Need to match dimensions - w is mid_planes, but B_vec is out_planes
-            # We'll apply B_vec after γ transformation
-
-            # For now, compute B_vec at out_planes dimension
             # We need x_j at full feature dimension for ASC
             x_j_full = x_v_grouped  # (n, nsample, out_planes)
             x_i_full = x_v.unsqueeze(1).expand_as(x_j_full)  # (n, nsample, out_planes)
 
-            # Positions
+            # Positions - USE RAW RELATIVE COORDINATES!
             p_i = p.unsqueeze(1).expand(-1, self.nsample, -1)  # (n, nsample, 3)
-            p_j = p_i + p_r[:, :, :3]  # Approximate (not exact, but close enough)
+            p_j = p_i + p_r_raw  # Use preserved raw coordinates, NOT transformed p_r!
 
             # Generate B_vec
             B_vec = self.vector_kernel(

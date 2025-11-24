@@ -137,20 +137,65 @@ class ModelNet40Dataset(torch.utils.data.Dataset):
             choice = np.random.choice(xyz.shape[0], self.num_points, replace=False)
             xyz = xyz[choice]
 
+        # Data augmentation (training only)
+        if self.split == 'train':
+            # Random rotation around z-axis
+            theta = np.random.uniform(0, 2 * np.pi)
+            rotation_matrix = np.array([
+                [np.cos(theta), -np.sin(theta), 0],
+                [np.sin(theta), np.cos(theta), 0],
+                [0, 0, 1]
+            ])
+            xyz = xyz @ rotation_matrix.T
+
+            # Random scaling
+            scale = np.random.uniform(0.8, 1.2)
+            xyz = xyz * scale
+
+            # Random jitter
+            xyz += np.random.normal(0, 0.02, size=xyz.shape)
+
         # Normalize to unit sphere
         xyz = xyz - xyz.mean(axis=0)
         xyz = xyz / (np.max(np.linalg.norm(xyz, axis=1)) + 1e-8)
 
-        # Estimate normals (simple: point to centroid)
-        centroid = xyz.mean(axis=0)
-        normals = xyz - centroid
-        normals = normals / (np.linalg.norm(normals, axis=1, keepdims=True) + 1e-8)
+        # Estimate surface normals using k-NN PCA
+        normals = self._compute_normals_pca(xyz, k=10)
 
         return {
             'xyz': torch.FloatTensor(xyz),
             'normals': torch.FloatTensor(normals),
             'label': torch.LongTensor([label])
         }
+
+    def _compute_normals_pca(self, xyz, k=10):
+        """Compute surface normals using PCA on k-nearest neighbors"""
+        from sklearn.neighbors import NearestNeighbors
+        from sklearn.decomposition import PCA
+
+        normals = np.zeros_like(xyz)
+        nbrs = NearestNeighbors(n_neighbors=k, algorithm='auto').fit(xyz)
+
+        for i in range(len(xyz)):
+            # Find k nearest neighbors
+            distances, indices = nbrs.kneighbors(xyz[i:i+1])
+            neighbors = xyz[indices[0]]
+
+            # PCA to find normal (smallest principal component)
+            pca = PCA(n_components=3)
+            pca.fit(neighbors - neighbors.mean(axis=0))
+            normal = pca.components_[-1]  # Smallest variance = normal direction
+
+            # Ensure consistent orientation (point outward from centroid)
+            centroid = xyz.mean(axis=0)
+            if np.dot(normal, xyz[i] - centroid) < 0:
+                normal = -normal
+
+            normals[i] = normal
+
+        # Normalize
+        normals = normals / (np.linalg.norm(normals, axis=1, keepdims=True) + 1e-8)
+        return normals
 
 
 # ============================================================================

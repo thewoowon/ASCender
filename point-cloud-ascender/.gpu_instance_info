@@ -1,0 +1,5 @@
+INSTANCE_ID=i-057e9c82bf2fef923
+PUBLIC_IP=3.86.102.239
+INSTANCE_TYPE=g5.xlarge
+TERRAFORM_DIR=/Users/aepeul/ASCender/terraform
+BUCKET=ascender-research-20251005
