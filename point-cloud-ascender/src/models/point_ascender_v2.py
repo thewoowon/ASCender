@@ -156,9 +156,10 @@ class VectorKernelEncoder(nn.Module):
         delta_p = p_i.unsqueeze(1) - p_j  # (N, k, 3)
         dist = delta_p.norm(dim=-1, keepdim=True)  # (N, k, 1)
 
-        # Local density (inverse of mean distance to neighbors)
+        # Local density (log-based for numerical stability)
+        # Using -log(dist) instead of 1/dist to avoid gradient explosion
         mean_dist = dist.mean(dim=1, keepdim=True)  # (N, 1, 1)
-        density = 1.0 / (mean_dist + 1e-6)  # (N, 1, 1)
+        density = -torch.log(mean_dist + 1e-6)  # (N, 1, 1)
         density_broadcast = density.expand(N, k, 1)  # (N, k, 1)
 
         # Separation kernel: Gaussian-weighted by distance and density
@@ -261,9 +262,10 @@ class VectorKernelEncoder(nn.Module):
 
 class ASCGraphReweight(nn.Module):
     """
-    Level 1: ASC-aware neighbor selection
+    Level 1: ASC-based neighbor reweighting
 
-    Instead of fixed k-NN, reweight neighbors based on ASC scores.
+    Applies soft gating to k-NN neighbors based on Boids principles (Alignment, Separation, Cohesion).
+    Note: This is NOT hard selection/filtering, but multiplicative reweighting of neighbor features.
     """
 
     def __init__(self, cfg: ASCenderV2Config):
@@ -381,9 +383,9 @@ class PointTransformerLayerASC(nn.Module):
     Point Transformer Layer with ASCender v2.0
 
     Three-level intervention:
-    1. Graph: ASC-aware neighbor selection (optional)
-    2. Kernel: Vector B_vec added to relation
-    3. Value: RBP + gating modulation
+    1. Graph: ASC-based neighbor reweighting (soft gating, optional)
+    2. Kernel: Vector B_vec added to attention relation
+    3. Value: RBP (Residual Bias Path) + gating modulation
     """
 
     def __init__(
@@ -433,6 +435,8 @@ class PointTransformerLayerASC(nn.Module):
             # Level 2: Vector kernel encoder
             if self.cfg.enable_vector_kernel:
                 self.vector_kernel = VectorKernelEncoder(out_planes, self.cfg)
+                # Learnable scale for B_vec injection (replaces magic number 0.1)
+                self.boids_scale = nn.Parameter(torch.tensor(0.1))  # init: small bias
 
             # Level 3: Value pathway modulator
             if self.cfg.enable_value_rbp or self.cfg.enable_value_gating:
@@ -553,9 +557,9 @@ class PointTransformerLayerASC(nn.Module):
         if self.use_ascender and self.cfg.enable_vector_kernel:
             # Expand w to full out_planes for B_vec addition
             # This is a bit tricky - in original PT, w is compressed
-            # We'll add B_vec influence through a projection
+            # We'll add B_vec influence through a projection with learnable scale
             w_expanded = w.repeat(1, 1, self.share_planes)  # (n, nsample, out_planes)
-            w_expanded = w_expanded + 0.1 * B_vec  # Small additive term
+            w_expanded = w_expanded + self.boids_scale * B_vec  # Learnable scale (trained)
             w = w_expanded[:, :, ::self.share_planes]  # Downsample back
 
         # Softmax to get attention weights

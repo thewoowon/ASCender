@@ -1,0 +1,227 @@
+# Terraform Configuration for Parallel ASCender Experiments
+# Launches 42 GPU spot instances in parallel for complete statistical validation
+
+terraform {
+  required_version = ">= 1.5.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = ">= 5.0.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.region
+}
+
+# ============================================================================
+# Variables
+# ============================================================================
+
+variable "region" { default = "us-east-1" }
+variable "subnet_id" {}
+variable "security_group" {}
+variable "key_name" {}
+variable "bucket_name" {}
+variable "gpu_ami" { default = "ami-003b184e823d3e894" }  # Deep Learning AMI GPU PyTorch
+variable "instance_profile_name" { default = "AscenderEC2Profile" }
+
+# Number of parallel experiments
+variable "num_experiments" {
+  default = 42
+  description = "Total experiments: 40 main + 2 gradient analysis"
+}
+
+# ============================================================================
+# S3 Bucket (already exists from your config)
+# ============================================================================
+
+data "aws_s3_bucket" "asc" {
+  bucket = var.bucket_name
+}
+
+# ============================================================================
+# IAM Role (reuse existing)
+# ============================================================================
+
+data "aws_iam_instance_profile" "ec2_profile" {
+  name = var.instance_profile_name
+}
+
+# ============================================================================
+# Experiment Configurations
+# ============================================================================
+
+locals {
+  seeds = [42, 123, 456, 789, 2024]
+  hidden_dims = [32, 48, 64, 80]
+
+  # Generate all 40 main experiments
+  main_experiments = flatten([
+    for h in local.hidden_dims : [
+      for seed in local.seeds : [
+        {
+          name = "h${h}_baseline_seed${seed}"
+          hidden_dim = h
+          use_ascender = false
+          seed = seed
+          exp_type = "main"
+        },
+        {
+          name = "h${h}_ascender_seed${seed}"
+          hidden_dim = h
+          use_ascender = true
+          seed = seed
+          exp_type = "main"
+        }
+      ]
+    ]
+  ])
+
+  # Add 2 gradient analysis experiments
+  gradient_experiments = [
+    {
+      name = "gradient_h48_seed42"
+      hidden_dim = 48
+      use_ascender = false
+      seed = 42
+      exp_type = "gradient"
+    },
+    {
+      name = "gradient_h64_seed42"
+      hidden_dim = 64
+      use_ascender = false
+      seed = 42
+      exp_type = "gradient"
+    }
+  ]
+
+  # Combine all experiments
+  all_experiments = concat(local.main_experiments, local.gradient_experiments)
+}
+
+# ============================================================================
+# User Data Template
+# ============================================================================
+
+data "template_file" "experiment_userdata" {
+  count = length(local.all_experiments)
+
+  template = file("${path.module}/userdata_experiment.sh")
+
+  vars = {
+    BUCKET       = var.bucket_name
+    EXP_NAME     = local.all_experiments[count.index].name
+    HIDDEN_DIM   = local.all_experiments[count.index].hidden_dim
+    USE_ASCENDER = local.all_experiments[count.index].use_ascender ? "--use-ascender" : ""
+    SEED         = local.all_experiments[count.index].seed
+    EXP_TYPE     = local.all_experiments[count.index].exp_type
+  }
+}
+
+# ============================================================================
+# Spot Fleet Request (Recommended for cost optimization)
+# ============================================================================
+
+resource "aws_spot_fleet_request" "asc_experiments" {
+  allocation_strategy      = "capacity-optimized"
+  target_capacity         = var.num_experiments
+  spot_price              = "0.60"  # Max $0.60/hr (g4dn.xlarge spot ~$0.16)
+  terminate_instances_with_expiration = true
+  wait_for_fulfillment    = true
+  iam_fleet_role          = aws_iam_role.spot_fleet_role.arn
+
+  # Multiple instance types for better availability
+  launch_specification {
+    ami                    = var.gpu_ami
+    instance_type          = "g4dn.xlarge"  # 1x T4 GPU, cheapest
+    key_name               = var.key_name
+    subnet_id              = var.subnet_id
+    vpc_security_group_ids = [var.security_group]
+    iam_instance_profile   = var.instance_profile_name
+
+    user_data = base64encode(data.template_file.experiment_userdata[0].rendered)
+
+    root_block_device {
+      volume_size = 100
+      volume_type = "gp3"
+      delete_on_termination = true
+    }
+
+    tags = {
+      Name    = "asc-exp-g4dn"
+      Project = "ASCender"
+    }
+  }
+
+  launch_specification {
+    ami                    = var.gpu_ami
+    instance_type          = "g5.xlarge"  # 1x A10G GPU, faster alternative
+    key_name               = var.key_name
+    subnet_id              = var.subnet_id
+    vpc_security_group_ids = [var.security_group]
+    iam_instance_profile   = var.instance_profile_name
+
+    user_data = base64encode(data.template_file.experiment_userdata[0].rendered)
+
+    root_block_device {
+      volume_size = 100
+      volume_type = "gp3"
+      delete_on_termination = true
+    }
+
+    tags = {
+      Name    = "asc-exp-g5"
+      Project = "ASCender"
+    }
+  }
+}
+
+# ============================================================================
+# IAM Role for Spot Fleet
+# ============================================================================
+
+resource "aws_iam_role" "spot_fleet_role" {
+  name = "AscenderSpotFleetRole"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Service = "spotfleet.amazonaws.com"
+      }
+      Action = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "spot_fleet_policy" {
+  role       = aws_iam_role.spot_fleet_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetTaggingRole"
+}
+
+# ============================================================================
+# Outputs
+# ============================================================================
+
+output "spot_fleet_id" {
+  value = aws_spot_fleet_request.asc_experiments.id
+  description = "Spot fleet request ID for monitoring"
+}
+
+output "s3_results_path" {
+  value = "s3://${var.bucket_name}/results/"
+  description = "S3 path where results will be uploaded"
+}
+
+output "total_experiments" {
+  value = length(local.all_experiments)
+  description = "Total number of experiments"
+}
+
+output "experiment_list" {
+  value = [for exp in local.all_experiments : exp.name]
+  description = "List of all experiment names"
+}

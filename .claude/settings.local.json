@@ -28,7 +28,16 @@
       "Bash(aws autoscaling set-desired-capacity:*)",
       "Bash(aws autoscaling describe-auto-scaling-groups:*)",
       "Bash(unzip:*)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Bash(./check_preprocessing_progress.sh:*)",
+      "Bash(./launch_aws_experiments.sh)",
+      "Bash(AUTO_CONFIRM=1 ./launch_aws_experiments.sh)",
+      "Bash(terraform init:*)",
+      "Bash(aws ec2 describe-spot-instance-requests:*)",
+      "Bash(aws service-quotas get-service-quota:*)",
+      "Bash(terraform destroy:*)",
+      "Bash(aws ec2 terminate-instances:*)",
+      "Bash(aws ec2 cancel-spot-instance-requests:*)"
     ],
     "deny": [],
     "ask": []
